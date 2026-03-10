@@ -1,0 +1,514 @@
+import { useState, useCallback, useRef, useEffect } from "react";
+
+// ─── LOAD SheetJS ─────────────────────────────────────────────────────────────
+function useSheetJS() {
+  const [ready, setReady] = useState(!!window.XLSX);
+  useEffect(() => {
+    if (window.XLSX) { setReady(true); return; }
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+    script.onload = () => setReady(true);
+    document.head.appendChild(script);
+  }, []);
+  return ready;
+}
+
+// ─── TEXT NORMALIZATION ───────────────────────────────────────────────────────
+const REMOVE_WORDS = [
+  "FARMACIA","FARM","BOTICA","DROGUERIA","DRG","PHARMA",
+  "LOCAL","SUCURSAL","FARMACEUTICA","FARMACÉUTICA","DISPENSARIO","DISPENSARY"
+];
+
+function removeAccents(str) {
+  return str.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+function normalizeText(text) {
+  if (!text) return "";
+  let s = String(text).toUpperCase();
+  s = removeAccents(s);
+  s = s.replace(/[^A-Z0-9\s]/g, " ");
+  REMOVE_WORDS.forEach(w => {
+    s = s.replace(new RegExp(`\\b${w}\\.?\\b`, "g"), " ");
+  });
+  return s.replace(/\s+/g, " ").trim();
+}
+
+// ─── LEVENSHTEIN SIMILARITY ───────────────────────────────────────────────────
+function similarity(a, b) {
+  const na = normalizeText(a), nb = normalizeText(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 100;
+  const m = na.length, n = nb.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = na[i-1] === nb[j-1]
+        ? dp[i-1][j-1]
+        : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+  return Math.round((1 - dp[m][n] / Math.max(m, n)) * 100);
+}
+
+// ─── COLUMN DETECTION ─────────────────────────────────────────────────────────
+const NAME_COLS = ["FARMACIA","CLIENTE","ESTABLECIMIENTO","NOMBRE CLIENTE","PUNTO DE VENTA","LOCAL","NOMBRE LOCAL","NOMBRE"];
+const CITY_COLS = ["CIUDAD","CANTON","CANTÓN","CITY"];
+const PROV_COLS = ["PROVINCIA","PROVINCE","PROV"];
+const ADDR_COLS = ["DIRECCION","DIRECCIÓN","ADDRESS","DIR","DOMICILIO"];
+
+function detectCol(headers, candidates) {
+  const n = h => removeAccents(h.toUpperCase().trim());
+  for (const c of candidates) {
+    const f = headers.find(h => n(h) === removeAccents(c));
+    if (f) return f;
+  }
+  for (const c of candidates) {
+    const f = headers.find(h => n(h).includes(removeAccents(c)));
+    if (f) return f;
+  }
+  return null;
+}
+
+// ─── FILE PARSERS ─────────────────────────────────────────────────────────────
+function parseCSVText(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (!lines.length) return [];
+  const sep = lines[0].includes(";") ? ";" : ",";
+  const headers = lines[0].split(sep).map(h => h.replace(/^"|"$/g, "").trim());
+  return lines.slice(1).map(line => {
+    const vals = line.split(sep).map(v => v.replace(/^"|"$/g, "").trim());
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = vals[i] || ""; });
+    return obj;
+  }).filter(r => Object.values(r).some(v => v));
+}
+
+function parseExcelBuffer(buffer, sheetIndex = 0) {
+  const XLSX = window.XLSX;
+  const wb = XLSX.read(buffer, { type: "array" });
+  const sheetName = wb.SheetNames[sheetIndex];
+  const ws = wb.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+  return { rows, sheetNames: wb.SheetNames };
+}
+
+function readFileAsync(file) {
+  return new Promise((resolve, reject) => {
+    const isExcel = /\.(xlsx|xls|xlsm)$/i.test(file.name);
+    const reader = new FileReader();
+    if (isExcel) {
+      reader.onload = e => resolve({ type: "excel", data: new Uint8Array(e.target.result), name: file.name });
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    } else {
+      reader.onload = e => resolve({ type: "csv", data: e.target.result, name: file.name });
+      reader.onerror = reject;
+      reader.readAsText(file, "utf-8");
+    }
+  });
+}
+
+// ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
+function matchRecord(record, gdc, colMap) {
+  const normName = normalizeText(record[colMap.name] || "");
+  const normCity = normalizeText(record[colMap.city] || "");
+  const normAddr = normalizeText(record[colMap.addr] || "");
+
+  const pool = normCity
+    ? gdc.filter(g => normalizeText(g["CIUDAD"] || "") === normCity)
+    : gdc;
+  const searchPool = pool.length > 0 ? pool : gdc;
+
+  let best = null, bestScore = 0, bestType = "NO_MATCH";
+
+  for (const g of searchPool) {
+    const gName = normalizeText(g["PUNTO DE VENTA"] || "");
+    const gCity = normalizeText(g["CIUDAD"] || "");
+    const gAddr = normalizeText(g["DIRECCIÓN"] || g["DIRECCION"] || "");
+    const cityMatch = normCity ? normCity === gCity : true;
+
+    if (normName === gName && cityMatch) {
+      return { ...g, MATCH_SCORE: 100, TIPO_MATCH: "EXACT_MATCH" };
+    }
+
+    const nameSim = similarity(normName, gName);
+    if (nameSim >= 88 && cityMatch) {
+      const score = Math.round(nameSim * 0.85 + (cityMatch ? 15 : 0));
+      if (score > bestScore) { bestScore = score; best = g; bestType = "FUZZY_MATCH"; }
+    }
+
+    if (normAddr && gAddr) {
+      const addrSim = similarity(normAddr, gAddr);
+      if (addrSim >= 80 && cityMatch) {
+        const score = Math.round(addrSim * 0.7 + (cityMatch ? 20 : 0));
+        if (score > bestScore) { bestScore = score; best = g; bestType = "ADDRESS_MATCH"; }
+      }
+    }
+
+    if (normName && gName && nameSim >= 55) {
+      const words = normName.split(" ").filter(w => w.length > 2);
+      const matched = words.filter(w => gName.includes(w));
+      if (words.length > 0) {
+        const aiScore = Math.round((matched.length / words.length) * 75 + (cityMatch ? 15 : 0));
+        if (aiScore >= 60 && aiScore > bestScore) {
+          bestScore = aiScore; best = g; bestType = "AI_MATCH";
+        }
+      }
+    }
+  }
+
+  if (best) return { ...best, MATCH_SCORE: bestScore, TIPO_MATCH: bestType };
+  return { "COD POS": null, "PUNTO DE VENTA": null, MATCH_SCORE: 0, TIPO_MATCH: "NO_MATCH" };
+}
+
+// ─── EXPORT CSV ───────────────────────────────────────────────────────────────
+function exportCSV(rows, filename) {
+  if (!rows.length) return;
+  const keys = Object.keys(rows[0]);
+  const csv = [keys.join(";"), ...rows.map(r => keys.map(k => `"${(r[k]??"")}"`).join(";"))].join("\n");
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+  a.download = filename; a.click();
+}
+
+// ─── ICONS ────────────────────────────────────────────────────────────────────
+const IconUpload = () => (
+  <svg width="26" height="26" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
+    <path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M12 12V4m0 0L8 8m4-4l4 4" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+);
+const IconDownload = () => (
+  <svg width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+    <path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M12 4v12m0 0l-4-4m4 4l4-4" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+);
+const IconDB = () => (
+  <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
+    <ellipse cx="12" cy="5" rx="9" ry="3"/>
+    <path d="M3 5v4c0 1.657 4.03 3 9 3s9-1.343 9-3V5M3 9v4c0 1.657 4.03 3 9 3s9-1.343 9-3V9M3 13v4c0 1.657 4.03 3 9 3s9-1.343 9-3v-4"/>
+  </svg>
+);
+
+// ─── BADGE ────────────────────────────────────────────────────────────────────
+const BADGE_CLR = { EXACT_MATCH:"#22c55e", FUZZY_MATCH:"#f59e0b", ADDRESS_MATCH:"#3b82f6", AI_MATCH:"#a855f7", NO_MATCH:"#ef4444" };
+const Badge = ({ type }) => {
+  const c = BADGE_CLR[type] || "#64748b";
+  return (
+    <span style={{ background:`${c}20`, color:c, border:`1px solid ${c}50`, borderRadius:4, padding:"2px 8px", fontSize:10, fontWeight:600, fontFamily:"'DM Mono',monospace", whiteSpace:"nowrap" }}>
+      {type}
+    </span>
+  );
+};
+
+// ─── METRIC CARD ──────────────────────────────────────────────────────────────
+const MetricCard = ({ label, value, color, pct }) => (
+  <div style={{ background:"#0f172a", border:`1px solid ${color}25`, borderRadius:10, padding:"13px 15px" }}>
+    <div style={{ fontSize:24, fontWeight:700, color, fontFamily:"'DM Mono',monospace" }}>{value}</div>
+    {pct !== undefined && (
+      <div style={{ height:3, background:"#1e293b", borderRadius:2, margin:"6px 0" }}>
+        <div style={{ height:3, width:`${pct}%`, background:color, borderRadius:2, transition:"width 0.6s" }}/>
+      </div>
+    )}
+    <div style={{ fontSize:10, color:"#475569", textTransform:"uppercase", letterSpacing:1 }}>{label}</div>
+  </div>
+);
+
+// ─── DROP ZONE ────────────────────────────────────────────────────────────────
+function DropZone({ label, sublabel, onFile, loaded, color, accept, tag }) {
+  const [drag, setDrag] = useState(false);
+  const ref = useRef();
+  const handle = useCallback(file => { if (file) onFile(file); }, [onFile]);
+  return (
+    <div
+      onClick={() => ref.current.click()}
+      onDragOver={e => { e.preventDefault(); setDrag(true); }}
+      onDragLeave={() => setDrag(false)}
+      onDrop={e => { e.preventDefault(); setDrag(false); handle(e.dataTransfer.files[0]); }}
+      style={{ border:`2px dashed ${drag ? color : loaded ? color : "#334155"}`, borderRadius:12, padding:"24px 18px", cursor:"pointer", textAlign:"center", background: loaded ? `${color}10` : drag ? `${color}06` : "#0a1020", transition:"all 0.2s" }}
+    >
+      <input ref={ref} type="file" accept={accept} style={{ display:"none" }} onChange={e => handle(e.target.files[0])} />
+      <div style={{ color: loaded ? color : "#475569", marginBottom:8 }}>
+        {loaded
+          ? <svg width="22" height="22" fill="none" stroke={color} strokeWidth="2.5" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          : <IconUpload />}
+      </div>
+      <div style={{ fontFamily:"'DM Mono',monospace", fontSize:12, color: loaded ? color : "#94a3b8", fontWeight:600 }}>{label}</div>
+      <div style={{ fontSize:10, color:"#475569", marginTop:4 }}>{sublabel}</div>
+      {tag && <div style={{ marginTop:8, fontSize:10, color, fontFamily:"'DM Mono',monospace" }}>{tag}</div>}
+    </div>
+  );
+}
+
+// ─── SHEET SELECTOR ───────────────────────────────────────────────────────────
+function SheetSelector({ sheets, selected, onChange }) {
+  if (!sheets || sheets.length <= 1) return null;
+  return (
+    <div style={{ display:"flex", gap:6, alignItems:"center", marginTop:8, flexWrap:"wrap" }}>
+      <span style={{ fontSize:10, color:"#475569", fontFamily:"'DM Mono',monospace" }}>HOJA:</span>
+      {sheets.map((s, i) => (
+        <button key={s} onClick={e => { e.stopPropagation(); onChange(i); }}
+          style={{ background: selected===i ? "#6366f120":"none", border:`1px solid ${selected===i?"#6366f1":"#334155"}`,
+            color: selected===i?"#6366f1":"#64748b", borderRadius:5, padding:"2px 10px", fontSize:11, cursor:"pointer", fontFamily:"'DM Mono',monospace" }}>
+          {s}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const xlsxReady = useSheetJS();
+
+  const [gdcData, setGdcData]       = useState(null);
+  const [gdcName, setGdcName]       = useState(null);
+  const [provRaw, setProvRaw]       = useState(null);
+  const [provData, setProvData]     = useState(null);
+  const [provName, setProvName]     = useState(null);
+  const [provSheets, setProvSheets] = useState(null);
+  const [provSheet, setProvSheet]   = useState(0);
+  const [provType, setProvType]     = useState(null);
+  const [results, setResults]       = useState(null);
+  const [noMatch, setNoMatch]       = useState(null);
+  const [metrics, setMetrics]       = useState(null);
+  const [colMap, setColMap]         = useState(null);
+  const [processing, setProcessing] = useState(false);
+  const [tab, setTab]               = useState("results");
+  const [page, setPage]             = useState(0);
+  const PAGE_SIZE = 20;
+
+  const handleGDC = useCallback(async (file) => {
+    const r = await readFileAsync(file);
+    let rows;
+    if (r.type === "excel") {
+      rows = parseExcelBuffer(r.data, 0).rows;
+    } else {
+      rows = parseCSVText(r.data);
+    }
+    setGdcData(rows); setGdcName(file.name); setResults(null);
+  }, []);
+
+  const handleProv = useCallback(async (file) => {
+    const r = await readFileAsync(file);
+    setProvRaw(r); setProvName(file.name); setProvType(r.type); setResults(null);
+    if (r.type === "excel") {
+      const parsed = parseExcelBuffer(r.data, 0);
+      setProvData(parsed.rows); setProvSheets(parsed.sheetNames); setProvSheet(0);
+    } else {
+      setProvData(parseCSVText(r.data)); setProvSheets(null); setProvSheet(0);
+    }
+  }, []);
+
+  const handleSheetChange = useCallback((idx) => {
+    if (!provRaw || provRaw.type !== "excel") return;
+    const parsed = parseExcelBuffer(provRaw.data, idx);
+    setProvData(parsed.rows); setProvSheet(idx); setResults(null);
+  }, [provRaw]);
+
+  const process = () => {
+    if (!gdcData || !provData) return;
+    setProcessing(true);
+    setTimeout(() => {
+      const headers = Object.keys(provData[0] || {});
+      const detected = {
+        name: detectCol(headers, NAME_COLS) || headers[0],
+        city: detectCol(headers, CITY_COLS),
+        prov: detectCol(headers, PROV_COLS),
+        addr: detectCol(headers, ADDR_COLS),
+      };
+      setColMap(detected);
+
+      const matched = [], unmatched = [];
+      let exact=0, fuzzy=0, address=0, ai=0, none=0;
+      for (const rec of provData) {
+        const r = matchRecord(rec, gdcData, detected);
+        const enriched = { ...rec, ...r };
+        if (r.TIPO_MATCH === "NO_MATCH") { none++; unmatched.push(enriched); }
+        else {
+          if (r.TIPO_MATCH === "EXACT_MATCH") exact++;
+          else if (r.TIPO_MATCH === "FUZZY_MATCH") fuzzy++;
+          else if (r.TIPO_MATCH === "ADDRESS_MATCH") address++;
+          else if (r.TIPO_MATCH === "AI_MATCH") ai++;
+          matched.push(enriched);
+        }
+      }
+      const total = provData.length;
+      setResults([...matched, ...unmatched]);
+      setNoMatch(unmatched);
+      setMetrics({ total, exact, fuzzy, address, ai, none, coverage: Math.round(((total-none)/total)*100) });
+      setProcessing(false); setTab("results"); setPage(0);
+    }, 80);
+  };
+
+  const displayRows = tab === "results" ? (results||[]) : (noMatch||[]);
+  const totalPages  = Math.ceil(displayRows.length / PAGE_SIZE);
+  const pageRows    = displayRows.slice(page*PAGE_SIZE, (page+1)*PAGE_SIZE);
+  const provCols    = provData ? Object.keys(provData[0]||{}).slice(0, 5) : [];
+  const coverageColor = !metrics ? "#64748b"
+    : metrics.coverage>=80 ? "#22c55e" : metrics.coverage>=60 ? "#f59e0b" : "#ef4444";
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#020617", color:"#e2e8f0", fontFamily:"'DM Sans','Segoe UI',sans-serif", display:"flex", flexDirection:"column" }}>
+
+      {/* HEADER */}
+      <div style={{ borderBottom:"1px solid #1e293b", padding:"16px 26px", display:"flex", alignItems:"center", gap:14, background:"linear-gradient(90deg,#020617,#0f172a)" }}>
+        <div style={{ width:40, height:40, borderRadius:10, background:"linear-gradient(135deg,#0ea5e9,#6366f1)", display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <IconDB />
+        </div>
+        <div>
+          <div style={{ fontWeight:700, fontSize:17 }}>POS <span style={{ color:"#0ea5e9" }}>Matcher</span></div>
+          <div style={{ fontSize:10, color:"#475569", fontFamily:"'DM Mono',monospace" }}>CONCILIACIÓN FARMACÉUTICA · BASE GDC · v2.0</div>
+        </div>
+        <div style={{ display:"flex", gap:5, marginLeft:14 }}>
+          {["CSV",".XLSX",".XLS","Multi-Hoja"].map(f => (
+            <span key={f} style={{ background:"#0f172a", border:"1px solid #1e293b", color:"#334155", borderRadius:4, padding:"2px 7px", fontSize:9, fontFamily:"'DM Mono',monospace" }}>{f}</span>
+          ))}
+        </div>
+        {!xlsxReady && <span style={{ marginLeft:"auto", fontSize:10, color:"#f59e0b", fontFamily:"'DM Mono',monospace" }}>⟳ cargando soporte Excel…</span>}
+        {metrics && (
+          <div style={{ marginLeft:"auto", background: metrics.coverage>=80?"#052e16": metrics.coverage>=60?"#1c1917":"#1f0707", border:`1px solid ${coverageColor}40`, borderRadius:8, padding:"7px 14px", display:"flex", alignItems:"center", gap:7 }}>
+            <span style={{ fontSize:21, fontWeight:700, fontFamily:"'DM Mono',monospace", color:coverageColor }}>{metrics.coverage}%</span>
+            <span style={{ fontSize:9, color:"#64748b" }}>COBERTURA</span>
+          </div>
+        )}
+      </div>
+
+      <div style={{ flex:1, padding:"20px 26px", maxWidth:1440, width:"100%", margin:"0 auto" }}>
+
+        {/* UPLOAD */}
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:18 }}>
+          <div>
+            <div style={{ fontSize:10, color:"#475569", textTransform:"uppercase", letterSpacing:1, marginBottom:7 }}>📋 Base Maestra GDC</div>
+            <DropZone label={gdcName||"Cargar GDC — CSV o Excel"} sublabel="COD POS · PUNTO DE VENTA · CIUDAD · DIRECCIÓN" onFile={handleGDC} loaded={!!gdcData} color="#0ea5e9" accept=".csv,.txt,.xlsx,.xls"/>
+            {gdcData && <div style={{ fontSize:10, color:"#0ea5e9", marginTop:5, fontFamily:"'DM Mono',monospace" }}>✓ {gdcData.length.toLocaleString()} registros</div>}
+          </div>
+          <div>
+            <div style={{ fontSize:10, color:"#475569", textTransform:"uppercase", letterSpacing:1, marginBottom:7 }}>
+              📦 Archivo Proveedor
+              <span style={{ marginLeft:8, background:"#6366f115", border:"1px solid #6366f130", color:"#6366f1", borderRadius:4, padding:"1px 7px", fontSize:9 }}>CSV · XLSX · XLS</span>
+            </div>
+            <DropZone
+              label={provName||"Cargar Proveedor — CSV o Excel"}
+              sublabel="Estructura heterogénea · Múltiples hojas soportadas"
+              onFile={handleProv} loaded={!!provData} color="#6366f1"
+              accept=".csv,.txt,.xlsx,.xls,.xlsm"
+              tag={provType==="excel" ? "📊 Formato Excel detectado" : null}
+            />
+            {provData && <div style={{ fontSize:10, color:"#6366f1", marginTop:5, fontFamily:"'DM Mono',monospace" }}>✓ {provData.length.toLocaleString()} registros · hoja: <b>{provSheets?.[provSheet]||"CSV"}</b></div>}
+            <SheetSelector sheets={provSheets} selected={provSheet} onChange={handleSheetChange} />
+          </div>
+        </div>
+
+        {/* COL MAP */}
+        {colMap && (
+          <div style={{ background:"#0a1020", border:"1px solid #1e293b", borderRadius:10, padding:"9px 16px", marginBottom:16, display:"flex", gap:18, flexWrap:"wrap", alignItems:"center" }}>
+            <span style={{ fontSize:10, color:"#475569", textTransform:"uppercase", letterSpacing:1 }}>Columnas detectadas:</span>
+            {[{ k:"NOMBRE", v:colMap.name, c:"#0ea5e9" },{ k:"CIUDAD", v:colMap.city, c:"#22c55e" },{ k:"PROVINCIA", v:colMap.prov, c:"#f59e0b" },{ k:"DIRECCIÓN", v:colMap.addr, c:"#a855f7" }].map(({ k,v,c }) => (
+              <div key={k} style={{ display:"flex", alignItems:"center", gap:5 }}>
+                <span style={{ fontSize:9, color:"#334155", fontFamily:"'DM Mono',monospace" }}>{k}</span>
+                <span style={{ background: v?`${c}15`:"#1e293b", color: v?c:"#334155", border:`1px solid ${v?c+"40":"#1e293b"}`, borderRadius:4, padding:"1px 8px", fontSize:11, fontFamily:"'DM Mono',monospace" }}>{v||"—"}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ACTIONS */}
+        <div style={{ display:"flex", gap:10, marginBottom:20, flexWrap:"wrap" }}>
+          <button onClick={process} disabled={!gdcData||!provData||processing||!xlsxReady}
+            style={{ background: gdcData&&provData&&xlsxReady?"linear-gradient(135deg,#0ea5e9,#6366f1)":"#1e293b",
+              color: gdcData&&provData&&xlsxReady?"#fff":"#475569", border:"none", borderRadius:8,
+              padding:"10px 24px", fontSize:12, fontWeight:700, cursor: gdcData&&provData&&xlsxReady?"pointer":"not-allowed",
+              fontFamily:"'DM Mono',monospace", letterSpacing:0.5, opacity:processing?0.7:1 }}>
+            {processing ? "⟳ PROCESANDO…" : "▶  EJECUTAR CONCILIACIÓN"}
+          </button>
+          {results && <>
+            <button onClick={() => exportCSV(results, "pos_resultado_final.csv")}
+              style={{ background:"#0f172a", border:"1px solid #22c55e40", color:"#22c55e", borderRadius:8, padding:"10px 16px", fontSize:11, cursor:"pointer", display:"flex", alignItems:"center", gap:5, fontFamily:"'DM Mono',monospace" }}>
+              <IconDownload /> Dataset Final
+            </button>
+            <button onClick={() => exportCSV(noMatch, "farmacias_no_encontradas.csv")}
+              style={{ background:"#0f172a", border:"1px solid #ef444440", color:"#ef4444", borderRadius:8, padding:"10px 16px", fontSize:11, cursor:"pointer", display:"flex", alignItems:"center", gap:5, fontFamily:"'DM Mono',monospace" }}>
+              <IconDownload /> Sin Coincidencia ({noMatch.length})
+            </button>
+          </>}
+        </div>
+
+        {/* METRICS */}
+        {metrics && (
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", gap:10, marginBottom:20 }}>
+            <MetricCard label="Total" value={metrics.total} color="#94a3b8" pct={100}/>
+            <MetricCard label="Exact" value={metrics.exact} color="#22c55e" pct={Math.round(metrics.exact/metrics.total*100)}/>
+            <MetricCard label="Fuzzy" value={metrics.fuzzy} color="#f59e0b" pct={Math.round(metrics.fuzzy/metrics.total*100)}/>
+            <MetricCard label="Address" value={metrics.address} color="#3b82f6" pct={Math.round(metrics.address/metrics.total*100)}/>
+            <MetricCard label="AI Match" value={metrics.ai} color="#a855f7" pct={Math.round(metrics.ai/metrics.total*100)}/>
+            <MetricCard label="Sin Match" value={metrics.none} color="#ef4444" pct={Math.round(metrics.none/metrics.total*100)}/>
+            <MetricCard label="Cobertura" value={`${metrics.coverage}%`} color={coverageColor} pct={metrics.coverage}/>
+          </div>
+        )}
+
+        {/* TABLE */}
+        {results && (
+          <div style={{ background:"#0a1020", border:"1px solid #1e293b", borderRadius:12, overflow:"hidden" }}>
+            <div style={{ display:"flex", borderBottom:"1px solid #1e293b" }}>
+              {[{ id:"results", label:`Resultados (${results.length})`, c:"#0ea5e9" },{ id:"nomatch", label:`Sin Coincidencia (${noMatch.length})`, c:"#ef4444" }].map(t => (
+                <button key={t.id} onClick={() => { setTab(t.id); setPage(0); }}
+                  style={{ background:"none", border:"none", padding:"11px 18px", cursor:"pointer", fontSize:11, fontFamily:"'DM Mono',monospace", fontWeight:600, color: tab===t.id?t.c:"#475569", borderBottom: tab===t.id?`2px solid ${t.c}`:"2px solid transparent" }}>{t.label}</button>
+              ))}
+            </div>
+            <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+                <thead>
+                  <tr style={{ background:"#020617" }}>
+                    {provCols.map(c => <th key={c} style={{ padding:"9px 13px", textAlign:"left", color:"#334155", fontFamily:"'DM Mono',monospace", fontSize:10, textTransform:"uppercase", letterSpacing:0.8, whiteSpace:"nowrap", borderBottom:"1px solid #1e293b" }}>{c}</th>)}
+                    <th style={{ padding:"9px 13px", color:"#0ea5e9", fontFamily:"'DM Mono',monospace", fontSize:10, textTransform:"uppercase", borderBottom:"1px solid #1e293b", whiteSpace:"nowrap" }}>COD POS</th>
+                    <th style={{ padding:"9px 13px", color:"#334155", fontFamily:"'DM Mono',monospace", fontSize:10, textTransform:"uppercase", borderBottom:"1px solid #1e293b" }}>SCORE</th>
+                    <th style={{ padding:"9px 13px", color:"#334155", fontFamily:"'DM Mono',monospace", fontSize:10, textTransform:"uppercase", borderBottom:"1px solid #1e293b" }}>TIPO</th>
+                    <th style={{ padding:"9px 13px", color:"#334155", fontFamily:"'DM Mono',monospace", fontSize:10, textTransform:"uppercase", borderBottom:"1px solid #1e293b", whiteSpace:"nowrap" }}>PdV GDC</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageRows.map((row, i) => (
+                    <tr key={i} style={{ borderBottom:"1px solid #0d1520", background: i%2===0?"#0a1020":"#0d1626" }}>
+                      {provCols.map(c => <td key={c} style={{ padding:"8px 13px", color:"#94a3b8", maxWidth:150, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{row[c]||"—"}</td>)}
+                      <td style={{ padding:"8px 13px", fontFamily:"'DM Mono',monospace", color: row["COD POS"]?"#0ea5e9":"#334155", fontWeight:700 }}>{row["COD POS"]||"—"}</td>
+                      <td style={{ padding:"8px 13px", fontFamily:"'DM Mono',monospace", color: row.MATCH_SCORE>=88?"#22c55e": row.MATCH_SCORE>=70?"#f59e0b":"#ef4444" }}>{row.MATCH_SCORE?`${row.MATCH_SCORE}%`:"—"}</td>
+                      <td style={{ padding:"8px 13px" }}><Badge type={row.TIPO_MATCH}/></td>
+                      <td style={{ padding:"8px 13px", color:"#475569", maxWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{row["PUNTO DE VENTA"]||"—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {totalPages > 1 && (
+              <div style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 14px", borderTop:"1px solid #1e293b", justifyContent:"flex-end" }}>
+                <button onClick={() => setPage(p => Math.max(0,p-1))} disabled={page===0} style={{ background:"none", border:"1px solid #1e293b", color:"#64748b", padding:"3px 12px", borderRadius:5, cursor:"pointer", fontSize:12 }}>←</button>
+                <span style={{ fontSize:11, color:"#475569", fontFamily:"'DM Mono',monospace" }}>{page+1} / {totalPages}</span>
+                <button onClick={() => setPage(p => Math.min(totalPages-1,p+1))} disabled={page===totalPages-1} style={{ background:"none", border:"1px solid #1e293b", color:"#64748b", padding:"3px 12px", borderRadius:5, cursor:"pointer", fontSize:12 }}>→</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* EMPTY STATE */}
+        {!results && (
+          <div style={{ textAlign:"center", padding:"52px 0", color:"#1e293b" }}>
+            <div style={{ fontSize:42, marginBottom:12 }}>⬡</div>
+            <div style={{ fontFamily:"'DM Mono',monospace", fontSize:13, color:"#334155" }}>Carga la Base GDC y el archivo proveedor para iniciar</div>
+            <div style={{ fontSize:11, marginTop:6, color:"#1e293b" }}>CSV · XLSX · XLS · XLSM — con soporte multi-hoja</div>
+            <div style={{ display:"flex", gap:10, justifyContent:"center", marginTop:16 }}>
+              {["Exact ≥ 100%","Fuzzy ≥ 88%","Address ≥ 80%","AI ≥ 60%"].map(t => (
+                <span key={t} style={{ background:"#0a1020", border:"1px solid #1e293b", borderRadius:6, padding:"3px 12px", fontSize:10, color:"#334155", fontFamily:"'DM Mono',monospace" }}>{t}</span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ borderTop:"1px solid #0a1020", padding:"9px 26px", fontSize:9, color:"#1e293b", fontFamily:"'DM Mono',monospace", display:"flex", justifyContent:"space-between" }}>
+        <span>POS MATCHER v2.0 · PHARMA DATA ENGINEERING</span>
+        <span>CSV · XLSX · XLS · MULTI-SHEET · FUZZY ≥88% · ADDRESS ≥80%</span>
+      </div>
+    </div>
+  );
+}
