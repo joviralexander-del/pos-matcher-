@@ -144,7 +144,31 @@ function parseExcelBuffer(buffer, sheetIndex = 0) {
   const wb = XLSX.read(buffer, { type: "array" });
   const sheetName = wb.SheetNames[sheetIndex];
   const ws = wb.Sheets[sheetName];
-  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+  // Leer todas las filas como array para detectar dónde están los headers reales
+  const rawRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+
+  // Buscar la fila que contiene headers reales (la primera fila con 3+ celdas no vacías y texto)
+  let headerRowIdx = 0;
+  for (let i = 0; i < Math.min(10, rawRows.length); i++) {
+    const row = rawRows[i];
+    const nonEmpty = row.filter(c => c !== "" && c !== null && c !== undefined);
+    // Si tiene 3+ valores de texto cortos (no párrafos con saltos de línea), es la fila de headers
+    if (nonEmpty.length >= 3 && nonEmpty.every(c => typeof c === "string" && !String(c).includes("\n") && String(c).length < 60)) {
+      headerRowIdx = i;
+      break;
+    }
+  }
+
+  const headers = rawRows[headerRowIdx].map(h => String(h).trim());
+  const rows = rawRows.slice(headerRowIdx + 1)
+    .filter(row => row.some(c => c !== "" && c !== null))
+    .map(row => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = row[i] !== undefined ? String(row[i]) : ""; });
+      return obj;
+    });
+
   return { rows, sheetNames: wb.SheetNames };
 }
 
@@ -172,14 +196,20 @@ function matchRecord(record, gdc, colMap) {
   const normProv = normalizeText(record[colMap.prov] || "");
   const normAddr = normalizeText(record[colMap.addr] || "");
 
-  // Filtrar GDC: primero por ciudad, si no hay ciudad filtrar por provincia
+  // Filtrar GDC: primero por ciudad, luego por provincia (intentando varios nombres de columna)
   let pool = gdc;
+  let geoFiltered = false;
+
   if (normCity) {
     const byCity = gdc.filter(g => normalizeText(g["CIUDAD"] || "") === normCity);
-    pool = byCity.length > 0 ? byCity : gdc;
+    if (byCity.length > 0) { pool = byCity; geoFiltered = true; }
   } else if (normProv) {
-    const byProv = gdc.filter(g => normalizeText(g["PROVINCIA"] || "") === normProv);
-    pool = byProv.length > 0 ? byProv : gdc;
+    // Intentar múltiples nombres de columna provincia en GDC
+    const provCols = ["PROVINCIA", "PROVINCIA VENTA", "PROV", "PROVINCE"];
+    for (const col of provCols) {
+      const byProv = gdc.filter(g => normalizeText(g[col] || "") === normProv);
+      if (byProv.length > 0) { pool = byProv; geoFiltered = true; break; }
+    }
   }
 
   let best = null, bestScore = 0, bestType = "NO_MATCH";
@@ -187,13 +217,16 @@ function matchRecord(record, gdc, colMap) {
   for (const g of pool) {
     const gName = normalizeText(g["PUNTO DE VENTA"] || "");
     const gCity = normalizeText(g["CIUDAD"] || "");
-    const gProv = normalizeText(g["PROVINCIA"] || "");
+    const gProv = normalizeText(
+      g["PROVINCIA"] || g["PROVINCIA VENTA"] || g["PROV"] || ""
+    );
     const gAddr = normalizeText(g["DIRECCIÓN"] || g["DIRECCION"] || "");
 
-    // Validar coincidencia geográfica
+    // geoMatch: si filtramos geográficamente, todos los del pool son válidos
+    // Si no filtramos, aceptar cualquiera pero penalizar menos
     const cityMatch = normCity ? normCity === gCity : true;
     const provMatch = normProv ? normProv === gProv : true;
-    const geoMatch = normCity ? cityMatch : normProv ? provMatch : true;
+    const geoMatch = geoFiltered ? true : (normCity ? cityMatch : normProv ? provMatch : true);
 
     // L1 — Exact
     if (normName === gName && geoMatch) {
@@ -395,13 +428,14 @@ export default function App() {
     };
     setColMap(detected);
 
-    // Deduplicar por nombre+ciudad para no repetir matches
+    // Deduplicar por nombre + ciudad/provincia
     const seen = new Set();
     const uniqueRecords = [];
-    const dupMap = {}; // clave -> resultado match
+    const dupMap = {};
 
     for (const rec of provData) {
-      const key = `${rec[detected.name]||""}__${rec[detected.city]||""}`;
+      const geo = rec[detected.city] || rec[detected.prov] || "";
+      const key = `${rec[detected.name]||""}__${geo}`;
       if (!seen.has(key)) {
         seen.add(key);
         uniqueRecords.push({ rec, key });
@@ -426,7 +460,8 @@ export default function App() {
 
     // Aplicar resultado a todos los registros originales
     for (const rec of provData) {
-      const key = `${rec[detected.name]||""}__${rec[detected.city]||""}`;
+      const geo = rec[detected.city] || rec[detected.prov] || "";
+      const key = `${rec[detected.name]||""}__${geo}`;
       const r = dupMap[key] || { "COD POS": null, MATCH_SCORE: 0, TIPO_MATCH: "NO_MATCH" };
       const enriched = { ...rec, ...r };
       if (r.TIPO_MATCH === "NO_MATCH") { none++; unmatched.push(enriched); }
