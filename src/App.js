@@ -32,6 +32,25 @@ function normalizeText(text) {
   REMOVE_WORDS.forEach(w => {
     s = s.replace(new RegExp(`\\b${w}\\b`, "g"), " ");
   });
+  s = expandAbbrev(s);
+  return s.replace(/\s+/g, " ").trim();
+}
+
+// Expansión de abreviaturas comunes (aplicada después de normalizeText)
+const TEXT_EXPANSIONS = [
+  [/\bHOS\b/g,  "HOSPITAL"],
+  [/\bHOSP\b/g, "HOSPITAL"],
+  [/\bCLIN\b/g, "CLINICA"],
+  [/\bPARQ\b/g, "PARQUE"],
+  [/\bAV\b/g,   "AVENIDA"],
+  [/\bCDLA\b/g, "CIUDADELA"],
+  [/\bPQ\b/g,   "PARQUE"],
+  [/\bSTO\b/g,  "SANTO"],
+  [/\bSTA\b/g,  "SANTA"],
+];
+
+function expandAbbrev(s) {
+  for (const [re, val] of TEXT_EXPANSIONS) s = s.replace(re, val);
   return s.replace(/\s+/g, " ").trim();
 }
 
@@ -58,6 +77,10 @@ const CHAIN_ALIASES = [
   { from: /^COM\b/,            to: "COMUNITARIA" },
   // Difarmes (GDC: FAR.MAY DIFARMES → normaliza a MAY DIFARMES)
   { from: /^MAY DIFARMES\b/,   to: "MAY DIFARMES" },
+  // DIFARMES standalone (Farmaenlace lo llama solo "DIFARMES ...")
+  { from: /^DIFARMES\b/,       to: "MAY DIFARMES" },
+  // PAF QUITO DIFARMES → quitar prefijo PAF QUITO para que quede DIFARMES ...
+  { from: /^PAF \w+ DIFARMES\b/, to: "MAY DIFARMES" },
 ];
 
 function stripSuffix(name) {
@@ -201,7 +224,12 @@ function normSuffix(s) {
 function suffixConflict(provName, gdcName) {
   const sp = normSuffix(extractSuffix(provName));
   const sg = normSuffix(extractSuffix(gdcName));
-  if (!sp || !sg) return false;             // sin sufijo → no bloquear
+  // Si proveedor tiene sufijo pero GDC no → bloquear
+  // (ECO CONOCOTO 2 ≠ FAR.ECONOMICA CONOCOTO — son locales distintos)
+  if (sp && !sg) return true;
+  // Si GDC tiene sufijo pero proveedor no → permitir
+  // (ECO ATARAZANA puede corresponder a FAR.ECONOMICA ATARAZANA #2 si es la única)
+  if (!sp || !sg) return false;
   if (sp === sg) return false;              // iguales → ok
   if (sg.startsWith(sp) || sp.startsWith(sg)) return false; // 6 vs 6B → ok
   return true;                              // distintos → bloquear
@@ -239,8 +267,17 @@ function chainAllowed(normProvName, normGdcName) {
 const GENERIC_WORDS = new Set([
   "ECONOMICA","MEDICITY","SANASANA","FYBECA","CRUZ","AZUL","PAF","MTR",
   "PHARMACYS","BP","COMUNITARIA","DIFARMES","MAY","DR","METRORED",
+  // Ciudades principales Ecuador (Farmaenlace embebe la ciudad en el nombre pero GDC no)
   "QUITO","GUAYAQUIL","AMBATO","RIOBAMBA","CUENCA","MANTA","LOJA",
-  "PORTOVIEJO","IBARRA","ESMERALDAS","MACHALA","LATACUNGA","SANTO"
+  "PORTOVIEJO","IBARRA","ESMERALDAS","MACHALA","LATACUNGA","SANTO",
+  "BABAHOYO","AZOGUES","TULCAN","GUARANDA","TENA","PUYO","MACAS",
+  "ZAMORA","NUEVA","LAGO","AGRIO","ALAUSI","DAULE","DURAN","CAYAMBE",
+  "OTAVALO","PILLARO","PELILEO","SALCEDO","PUJILI","SAQUISILI",
+  "SANGOLQUI","RUMINAHUI","TUMBACO","CUMBAYA","CONOCOTO","SACHA",
+  "COCA","ORELLANA","QUININDE","SANTODOMINGO","HUAQUILLAS","PASAJE",
+  "SANTA","ROSA","MILAGRO","NARANJAL","PLAYAS","GENERAL","PEDRO",
+  "CIUDAD","AV","AVENIDA","CALLE","CDLA","CIUDADELA","HOSP","HOSPITAL",
+  "CLINICA","IESS","PARQ","PARQUE","CC","CENTRO","COMERCIAL","NORTE","SUR","ESTE","OESTE",
 ]);
 
 function wordOverlapRatio(a, b) {
@@ -256,6 +293,11 @@ function wordOverlapRatio(a, b) {
 function matchRecord(record, gdc, colMap) {
   const rawName = stripSuffix(record[colMap.name] || "");
   const normName = applyAliases(normalizeText(rawName));
+
+  // Ignorar registros que no son puntos de venta reales
+  if (/OFICINA MATRIZ/i.test(rawName)) {
+    return { "COD POS": null, "PUNTO DE VENTA": "— OFICINA MATRIZ (ignorada)", MATCH_SCORE: 0, TIPO_MATCH: "NO_MATCH" };
+  }
   const normCity = normalizeText(record[colMap.city] || "");
   const normProv = normalizeText(record[colMap.prov] || "");
   const normAddr = normalizeText(record[colMap.addr] || "");
@@ -318,11 +360,13 @@ function matchRecord(record, gdc, colMap) {
       }
     }
 
-    // L4 — AI: overlap ALTO de palabras significativas — umbral estricto para evitar falsos positivos
-    // overlap >= 0.8 = al menos 80% de palabras únicas del proveedor aparecen en GDC
-    if (normName && gName && nameSim >= 65 && overlap >= 0.8 && geoMatch) {
+    // L4 — AI: overlap de palabras significativas
+    // Si ya tenemos filtro geográfico, relajamos overlap a 0.6 (la ciudad en el pool ya garantiza contexto)
+    // Sin filtro geo, mantenemos 0.8 para evitar falsos positivos
+    const aiOverlapThreshold = geoFiltered ? 0.6 : 0.8;
+    if (normName && gName && nameSim >= 65 && overlap >= aiOverlapThreshold && geoMatch) {
       const aiScore = Math.round(overlap * 80 + 10);
-      if (aiScore >= 75 && aiScore > bestScore) {
+      if (aiScore >= 59 && aiScore > bestScore) {
         bestScore = aiScore; best = g; bestType = "AI_MATCH";
       }
     }
