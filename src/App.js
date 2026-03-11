@@ -180,6 +180,33 @@ function readFileAsync(file) {
   });
 }
 
+// ─── SUFFIX CONFLICT — detecta locales distintos por número/letra ─────────────
+// Ej: "MUCHO LOTE 2" vs "MUCHO LOTE I" → conflicto; "SAUCES 6" vs "SAUCES 6B" → ok
+const ROMAN_TO_NUM = { I:"1",II:"2",III:"3",IV:"4",V:"5",VI:"6",VII:"7",VIII:"8",IX:"9",X:"10" };
+
+function extractSuffix(name) {
+  const words = name.trim().split(/\s+/);
+  if (!words.length) return null;
+  const last = words[words.length - 1];
+  if (/^[0-9]+[A-Z]?$/.test(last)) return last;          // 2, 6B, 3
+  if (/^[IVX]+$/.test(last) && ROMAN_TO_NUM[last]) return ROMAN_TO_NUM[last]; // I→1, VI→6
+  if (/^[A-Z]$/.test(last)) return last;                  // B
+  return null;
+}
+
+function normSuffix(s) {
+  return s ? (ROMAN_TO_NUM[s] || s) : null;
+}
+
+function suffixConflict(provName, gdcName) {
+  const sp = normSuffix(extractSuffix(provName));
+  const sg = normSuffix(extractSuffix(gdcName));
+  if (!sp || !sg) return false;             // sin sufijo → no bloquear
+  if (sp === sg) return false;              // iguales → ok
+  if (sg.startsWith(sp) || sp.startsWith(sg)) return false; // 6 vs 6B → ok
+  return true;                              // distintos → bloquear
+}
+
 // ─── CHAIN COMPATIBILITY MAP ──────────────────────────────────────────────────
 // Evita matches entre cadenas distintas (ECO → PAF MTR, MEDI → SANASANA, etc.)
 const CHAIN_MAP = [
@@ -265,8 +292,9 @@ function matchRecord(record, gdc, colMap) {
     const provMatch = normProv ? normProv === gProv : true;
     const geoMatch = geoFiltered ? true : (normCity ? cityMatch : normProv ? provMatch : true);
 
-    // Bloquear matches entre cadenas incompatibles (aplica a todos los niveles)
+    // Bloquear matches entre cadenas incompatibles o sufijos numéricos distintos
     if (!chainAllowed(normName, gName)) continue;
+    if (suffixConflict(normName, gName)) continue;
 
     // L1 — Exact
     if (normName === gName && geoMatch) {
