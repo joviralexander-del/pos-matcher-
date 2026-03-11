@@ -134,6 +134,7 @@ const NAME_COLS = ["NOMBRE LOCAL","FARMACIA","PUNTO DE VENTA","CLIENTE","ESTABLE
 const CITY_COLS = ["CIUDAD","CANTON","CANTÓN","CITY"];
 const PROV_COLS = ["PROVINCIA VENTA","PROVINCIA","PROVINCE","PROV"];
 const ADDR_COLS = ["DIRECCION","DIRECCIÓN","ADDRESS","DIR","DOMICILIO"];
+const CODE_COLS = ["COD LOCAL","CODIGO LOCAL","CÓDIGO LOCAL","CODIGO","CÓDIGO","ID LOCAL","LOCAL ID"];
 
 function detectCol(headers, candidates) {
   const normalizedHeaders = headers.map(h => ({ raw: h, norm: normHeader(h) }));
@@ -198,7 +199,7 @@ function parseExcelBuffer(buffer, preferredSheetIndex = 0, fileName = "") {
   let headerRowIdx = 0;
 
   if (normHeader(fileName).includes("BASE_GDC")) {
-    headerRowIdx = 2; // fila 3
+    headerRowIdx = 2;
   } else {
     for (let i = 0; i < Math.min(10, rawRows.length); i++) {
       const row = rawRows[i] || [];
@@ -226,7 +227,7 @@ function parseExcelBuffer(buffer, preferredSheetIndex = 0, fileName = "") {
       return obj;
     });
 
-  return { rows, sheetNames: wb.SheetNames };
+  return { rows, sheetNames: wb.SheetNames, activeSheetName: sheetName };
 }
 
 function readFileAsync(file) {
@@ -405,7 +406,7 @@ function matchRecord(record, preparedGdc, colMap) {
   if (/OFICINA MATRIZ/i.test(rawName)) {
     return {
       "COD POS": "",
-      "PUNTO DE VENTA": "— OFICINA MATRIZ (ignorada)",
+      "PUNTO DE VENTA": "",
       "CADENA": "",
       "BRICK": "",
       "PROVINCIA": "",
@@ -502,8 +503,16 @@ function matchRecord(record, preparedGdc, colMap) {
   };
 }
 
-// ─── STANDARD OUTPUT / EXCEL EXPORT ───────────────────────────────────────────
-const STANDARD_MATCH_COLS = [
+// ─── HOMOLOGATED OUTPUT ───────────────────────────────────────────────────────
+const OUTPUT_HEADERS = [
+  "PROVEEDOR",
+  "HOJA",
+  "COD_LOCAL_PROVEEDOR",
+  "NOMBRE_FARMACIA_PROVEEDOR",
+  "CADENA_PROVEEDOR",
+  "PROVINCIA_PROVEEDOR",
+  "CIUDAD_PROVEEDOR",
+  "DIRECCION_PROVEEDOR",
   "COD POS",
   "PUNTO DE VENTA",
   "CADENA",
@@ -515,17 +524,56 @@ const STANDARD_MATCH_COLS = [
   "TIPO_MATCH"
 ];
 
-function buildOutputRow(providerRow, matchRow, providerHeaders) {
-  const providerPart = {};
-  providerHeaders.forEach(h => {
-    providerPart[h] = providerRow?.[h] ?? "";
-  });
+function getProviderStandardFields(providerRow, colMap, providerCfg, providerName, activeSheetName) {
+  const rawName = providerRow?.[colMap.name] ?? "";
+  const rawCity = providerRow?.[colMap.city] ?? "";
+  const rawProv = providerRow?.[colMap.prov] ?? "";
+  const rawAddr = providerRow?.[colMap.addr] ?? "";
+  const codeCol = detectCol(Object.keys(providerRow || {}), CODE_COLS);
+  const rawCode = codeCol ? (providerRow?.[codeCol] ?? "") : "";
 
+  let cadenaProv = "";
+  if (providerCfg.isGPF) cadenaProv = "SANASANA";
+  else if (providerCfg.isFarmaenlace) {
+    const n = normalizeText(rawName);
+    if (n.startsWith("ECONOMICA")) cadenaProv = "ECONOMICA";
+    else if (n.startsWith("MEDICITY")) cadenaProv = "MEDICITY";
+    else if (n.startsWith("PAF MTR")) cadenaProv = "PAF MTR";
+    else if (n.startsWith("CRUZ AZUL")) cadenaProv = "CRUZ AZUL";
+    else if (n.startsWith("SANASANA")) cadenaProv = "SANASANA";
+    else if (n.startsWith("FYBECA")) cadenaProv = "FYBECA";
+    else if (n.startsWith("BP")) cadenaProv = "BP";
+    else if (n.startsWith("PHARMACYS")) cadenaProv = "PHARMACYS";
+    else if (n.startsWith("COMUNITARIA")) cadenaProv = "COMUNITARIA";
+    else if (n.startsWith("MAY DIFARMES")) cadenaProv = "MAY DIFARMES";
+  }
+
+  return {
+    PROVEEDOR: providerName || "",
+    HOJA: activeSheetName || "CSV",
+    COD_LOCAL_PROVEEDOR: rawCode,
+    NOMBRE_FARMACIA_PROVEEDOR: rawName,
+    CADENA_PROVEEDOR: cadenaProv,
+    PROVINCIA_PROVEEDOR: rawProv,
+    CIUDAD_PROVEEDOR: rawCity,
+    DIRECCION_PROVEEDOR: rawAddr
+  };
+}
+
+function buildOutputRow(providerRow, matchRow, colMap, providerCfg, providerName, activeSheetName) {
+  const prov = getProviderStandardFields(providerRow, colMap, providerCfg, providerName, activeSheetName);
   const brickRaw = matchRow?.["BRICK"] || "";
   const brickNum = /^\d+/.test(brickRaw) ? brickRaw.match(/^\d+/)[0] : brickRaw;
 
   return {
-    ...providerPart,
+    "PROVEEDOR": prov.PROVEEDOR,
+    "HOJA": prov.HOJA,
+    "COD_LOCAL_PROVEEDOR": prov.COD_LOCAL_PROVEEDOR,
+    "NOMBRE_FARMACIA_PROVEEDOR": prov.NOMBRE_FARMACIA_PROVEEDOR,
+    "CADENA_PROVEEDOR": prov.CADENA_PROVEEDOR,
+    "PROVINCIA_PROVEEDOR": prov.PROVINCIA_PROVEEDOR,
+    "CIUDAD_PROVEEDOR": prov.CIUDAD_PROVEEDOR,
+    "DIRECCION_PROVEEDOR": prov.DIRECCION_PROVEEDOR,
     "COD POS": matchRow?.["COD POS"] ?? "",
     "PUNTO DE VENTA": matchRow?.["PUNTO DE VENTA"] ?? "",
     "CADENA": matchRow?.["CADENA"] ?? "",
@@ -544,7 +592,7 @@ function autoWidthFromRows(rows, headers) {
       String(h || "").length,
       ...rows.slice(0, 1000).map(r => String(r?.[h] ?? "").length)
     );
-    return { wch: Math.min(Math.max(maxLen + 2, 12), 45) };
+    return { wch: Math.min(Math.max(maxLen + 2, 12), 40) };
   });
 }
 
@@ -554,20 +602,28 @@ function exportExcelWorkbook(allRows, noMatchRows, filenameBase = "pos_resultado
 
   const wb = XLSX.utils.book_new();
 
-  const allHeaders = Object.keys(allRows[0] || {});
-  const wsAll = XLSX.utils.json_to_sheet(allRows, { header: allHeaders });
+  const normalizedAll = allRows.map(r => {
+    const obj = {};
+    OUTPUT_HEADERS.forEach(h => { obj[h] = r?.[h] ?? ""; });
+    return obj;
+  });
+
+  const wsAll = XLSX.utils.json_to_sheet(normalizedAll, { header: OUTPUT_HEADERS });
   wsAll["!autofilter"] = { ref: wsAll["!ref"] };
-  wsAll["!cols"] = autoWidthFromRows(allRows, allHeaders);
+  wsAll["!cols"] = autoWidthFromRows(normalizedAll, OUTPUT_HEADERS);
   XLSX.utils.book_append_sheet(wb, wsAll, "RESULTADOS");
 
-  const nmRows = noMatchRows?.length
-    ? noMatchRows
-    : [Object.fromEntries(allHeaders.map(h => [h, ""]))];
+  const safeNoMatch = noMatchRows?.length
+    ? noMatchRows.map(r => {
+        const obj = {};
+        OUTPUT_HEADERS.forEach(h => { obj[h] = r?.[h] ?? ""; });
+        return obj;
+      })
+    : [Object.fromEntries(OUTPUT_HEADERS.map(h => [h, ""]))];
 
-  const nmHeaders = Object.keys(nmRows[0] || {});
-  const wsNo = XLSX.utils.json_to_sheet(nmRows, { header: nmHeaders });
+  const wsNo = XLSX.utils.json_to_sheet(safeNoMatch, { header: OUTPUT_HEADERS });
   wsNo["!autofilter"] = { ref: wsNo["!ref"] };
-  wsNo["!cols"] = autoWidthFromRows(nmRows, nmHeaders);
+  wsNo["!cols"] = autoWidthFromRows(safeNoMatch, OUTPUT_HEADERS);
   XLSX.utils.book_append_sheet(wb, wsNo, "NO_MATCH");
 
   XLSX.writeFile(wb, `${filenameBase}.xlsx`);
@@ -575,12 +631,19 @@ function exportExcelWorkbook(allRows, noMatchRows, filenameBase = "pos_resultado
 
 function exportExcelSingleSheet(rows, filename, sheetName = "NO_MATCH") {
   const XLSX = window.XLSX;
-  if (!XLSX || !rows?.length) return;
+  if (!XLSX) return;
 
-  const headers = Object.keys(rows[0] || {});
-  const ws = XLSX.utils.json_to_sheet(rows, { header: headers });
+  const safeRows = rows?.length
+    ? rows.map(r => {
+        const obj = {};
+        OUTPUT_HEADERS.forEach(h => { obj[h] = r?.[h] ?? ""; });
+        return obj;
+      })
+    : [Object.fromEntries(OUTPUT_HEADERS.map(h => [h, ""]))];
+
+  const ws = XLSX.utils.json_to_sheet(safeRows, { header: OUTPUT_HEADERS });
   ws["!autofilter"] = { ref: ws["!ref"] };
-  ws["!cols"] = autoWidthFromRows(rows, headers);
+  ws["!cols"] = autoWidthFromRows(safeRows, OUTPUT_HEADERS);
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, sheetName);
@@ -749,6 +812,7 @@ export default function App() {
   const [provName, setProvName]     = useState(null);
   const [provSheets, setProvSheets] = useState(null);
   const [provSheet, setProvSheet]   = useState(0);
+  const [provSheetName, setProvSheetName] = useState("CSV");
   const [provType, setProvType]     = useState(null);
   const [results, setResults]       = useState(null);
   const [noMatch, setNoMatch]       = useState(null);
@@ -758,6 +822,7 @@ export default function App() {
   const [tab, setTab]               = useState("results");
   const [page, setPage]             = useState(0);
   const [progress, setProgress]     = useState(0);
+  const [providerCfgState, setProviderCfgState] = useState({ isGPF:false, isFarmaenlace:false });
 
   const PAGE_SIZE = 20;
 
@@ -794,10 +859,12 @@ export default function App() {
       setProvData(parsed.rows);
       setProvSheets(parsed.sheetNames);
       setProvSheet(0);
+      setProvSheetName(parsed.activeSheetName || parsed.sheetNames?.[0] || "HOJA1");
     } else {
       setProvData(parseCSVText(r.data));
       setProvSheets(null);
       setProvSheet(0);
+      setProvSheetName("CSV");
     }
   }, []);
 
@@ -807,6 +874,7 @@ export default function App() {
     const parsed = parseExcelBuffer(provRaw.data, idx, provRaw.name);
     setProvData(parsed.rows);
     setProvSheet(idx);
+    setProvSheetName(parsed.activeSheetName || parsed.sheetNames?.[idx] || `HOJA${idx + 1}`);
     setResults(null);
     setNoMatch(null);
     setMetrics(null);
@@ -822,14 +890,15 @@ export default function App() {
     await new Promise(r => setTimeout(r, 30));
 
     const headers = Object.keys(provData[0] || {});
-    const providerHeaders = headers.slice();
     const providerCfg = getProviderConfig(provName, headers);
+    setProviderCfgState(providerCfg);
 
     let detected = {
       name: detectCol(headers, NAME_COLS) || headers[0],
       city: detectCol(headers, CITY_COLS),
       prov: detectCol(headers, PROV_COLS),
       addr: detectCol(headers, ADDR_COLS),
+      code: detectCol(headers, CODE_COLS),
     };
 
     if (providerCfg.isGPF) {
@@ -837,6 +906,7 @@ export default function App() {
         ...detected,
         name: resolveColumn(headers, "NOMBRE LOCAL", detected.name),
         city: resolveColumn(headers, "CIUDAD", detected.city),
+        code: resolveColumn(headers, "COD LOCAL", detected.code),
       };
     }
 
@@ -914,7 +984,14 @@ export default function App() {
         ...cleanR
       } = r;
 
-      const enriched = buildOutputRow(rec, cleanR, providerHeaders);
+      const enriched = buildOutputRow(
+        rec,
+        cleanR,
+        detected,
+        providerCfg,
+        provName,
+        provSheetName
+      );
 
       if (r.TIPO_MATCH === "NO_MATCH") {
         none++;
@@ -950,7 +1027,7 @@ export default function App() {
   const displayRows = tab === "results" ? (results || []) : (noMatch || []);
   const totalPages  = Math.max(1, Math.ceil(displayRows.length / PAGE_SIZE));
   const pageRows    = displayRows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-  const provCols    = provData ? Object.keys(provData[0] || {}).slice(0, 5) : [];
+  const previewCols = OUTPUT_HEADERS;
   const coverageColor = !metrics ? "#64748b"
     : metrics.coverage >= 80 ? "#22c55e"
     : metrics.coverage >= 60 ? "#f59e0b"
@@ -965,7 +1042,6 @@ export default function App() {
       display:"flex",
       flexDirection:"column"
     }}>
-
       <div style={{
         borderBottom:"1px solid #1e293b",
         padding:"16px 26px",
@@ -991,27 +1067,8 @@ export default function App() {
             POS <span style={{ color:"#0ea5e9" }}>Matcher</span>
           </div>
           <div style={{ fontSize:10, color:"#475569", fontFamily:"'DM Mono',monospace" }}>
-            CONCILIACIÓN FARMACÉUTICA · BASE GDC · v2.0
+            CONCILIACIÓN FARMACÉUTICA · SALIDA HOMOLOGADA · v3.0
           </div>
-        </div>
-
-        <div style={{ display:"flex", gap:5, marginLeft:14 }}>
-          {["XLSX",".XLS","CSV Input","Multi-Hoja"].map(f => (
-            <span
-              key={f}
-              style={{
-                background:"#0f172a",
-                border:"1px solid #1e293b",
-                color:"#334155",
-                borderRadius:4,
-                padding:"2px 7px",
-                fontSize:9,
-                fontFamily:"'DM Mono',monospace"
-              }}
-            >
-              {f}
-            </span>
-          ))}
         </div>
 
         {!xlsxReady && (
@@ -1049,8 +1106,7 @@ export default function App() {
         )}
       </div>
 
-      <div style={{ flex:1, padding:"20px 26px", maxWidth:1440, width:"100%", margin:"0 auto" }}>
-
+      <div style={{ flex:1, padding:"20px 26px", maxWidth:1500, width:"100%", margin:"0 auto" }}>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:18 }}>
           <div>
             <div style={{
@@ -1093,27 +1149,16 @@ export default function App() {
               marginBottom:7
             }}>
               📦 Archivo Proveedor
-              <span style={{
-                marginLeft:8,
-                background:"#6366f115",
-                border:"1px solid #6366f130",
-                color:"#6366f1",
-                borderRadius:4,
-                padding:"1px 7px",
-                fontSize:9
-              }}>
-                CSV · XLSX · XLS
-              </span>
             </div>
 
             <DropZone
               label={provName || "Cargar Proveedor — CSV o Excel"}
-              sublabel="Estructura heterogénea · Múltiples hojas soportadas"
+              sublabel="GPF · Farmaenlace · Otros"
               onFile={handleProv}
               loaded={!!provData}
               color="#6366f1"
               accept=".csv,.txt,.xlsx,.xls,.xlsm"
-              tag={provType === "excel" ? "📊 Formato Excel detectado" : null}
+              tag={provType === "excel" ? `📊 Hoja activa: ${provSheetName}` : "📄 Archivo CSV"}
             />
 
             {provData && (
@@ -1123,7 +1168,7 @@ export default function App() {
                 marginTop:5,
                 fontFamily:"'DM Mono',monospace"
               }}>
-                ✓ {provData.length.toLocaleString()} registros · hoja: <b>{provSheets?.[provSheet] || "CSV"}</b>
+                ✓ {provData.length.toLocaleString()} registros
               </div>
             )}
 
@@ -1156,7 +1201,8 @@ export default function App() {
               { k:"NOMBRE", v:colMap.name, c:"#0ea5e9" },
               { k:"CIUDAD", v:colMap.city, c:"#22c55e" },
               { k:"PROVINCIA", v:colMap.prov, c:"#f59e0b" },
-              { k:"DIRECCIÓN", v:colMap.addr, c:"#a855f7" }
+              { k:"DIRECCIÓN", v:colMap.addr, c:"#a855f7" },
+              { k:"CÓDIGO", v:colMap.code, c:"#38bdf8" }
             ].map(({ k, v, c }) => (
               <div key={k} style={{ display:"flex", alignItems:"center", gap:5 }}>
                 <span style={{ fontSize:9, color:"#334155", fontFamily:"'DM Mono',monospace" }}>{k}</span>
@@ -1306,7 +1352,7 @@ export default function App() {
               <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
                 <thead>
                   <tr style={{ background:"#020617" }}>
-                    {provCols.map(c => (
+                    {previewCols.map(c => (
                       <th
                         key={c}
                         style={{
@@ -1324,10 +1370,6 @@ export default function App() {
                         {c}
                       </th>
                     ))}
-                    <th style={{ padding:"9px 13px", color:"#0ea5e9", fontFamily:"'DM Mono',monospace", fontSize:10, textTransform:"uppercase", borderBottom:"1px solid #1e293b", whiteSpace:"nowrap" }}>COD POS</th>
-                    <th style={{ padding:"9px 13px", color:"#334155", fontFamily:"'DM Mono',monospace", fontSize:10, textTransform:"uppercase", borderBottom:"1px solid #1e293b" }}>SCORE</th>
-                    <th style={{ padding:"9px 13px", color:"#334155", fontFamily:"'DM Mono',monospace", fontSize:10, textTransform:"uppercase", borderBottom:"1px solid #1e293b" }}>TIPO</th>
-                    <th style={{ padding:"9px 13px", color:"#334155", fontFamily:"'DM Mono',monospace", fontSize:10, textTransform:"uppercase", borderBottom:"1px solid #1e293b", whiteSpace:"nowrap" }}>PdV GDC</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1339,53 +1381,26 @@ export default function App() {
                         background: i % 2 === 0 ? "#0a1020" : "#0d1626"
                       }}
                     >
-                      {provCols.map(c => (
+                      {previewCols.map(c => (
                         <td
                           key={c}
                           style={{
                             padding:"8px 13px",
-                            color:"#94a3b8",
-                            maxWidth:150,
+                            color: c === "TIPO_MATCH"
+                              ? "#e2e8f0"
+                              : c === "MATCH_SCORE"
+                              ? (row[c] >= 88 ? "#22c55e" : row[c] >= 70 ? "#f59e0b" : "#ef4444")
+                              : "#94a3b8",
+                            fontFamily: c === "MATCH_SCORE" ? "'DM Mono',monospace" : "inherit",
+                            maxWidth:180,
                             overflow:"hidden",
                             textOverflow:"ellipsis",
                             whiteSpace:"nowrap"
                           }}
                         >
-                          {row[c] || "—"}
+                          {c === "TIPO_MATCH" ? <Badge type={row[c]} /> : (row[c] || "—")}
                         </td>
                       ))}
-
-                      <td style={{
-                        padding:"8px 13px",
-                        fontFamily:"'DM Mono',monospace",
-                        color: row["COD POS"] ? "#0ea5e9" : "#334155",
-                        fontWeight:700
-                      }}>
-                        {row["COD POS"] || "—"}
-                      </td>
-
-                      <td style={{
-                        padding:"8px 13px",
-                        fontFamily:"'DM Mono',monospace",
-                        color: row.MATCH_SCORE >= 88 ? "#22c55e" : row.MATCH_SCORE >= 70 ? "#f59e0b" : "#ef4444"
-                      }}>
-                        {row.MATCH_SCORE ? `${row.MATCH_SCORE}%` : "—"}
-                      </td>
-
-                      <td style={{ padding:"8px 13px" }}>
-                        <Badge type={row.TIPO_MATCH}/>
-                      </td>
-
-                      <td style={{
-                        padding:"8px 13px",
-                        color:"#475569",
-                        maxWidth:200,
-                        overflow:"hidden",
-                        textOverflow:"ellipsis",
-                        whiteSpace:"nowrap"
-                      }}>
-                        {row["PUNTO DE VENTA"] || "—"}
-                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -1440,36 +1455,6 @@ export default function App() {
             )}
           </div>
         )}
-
-        {!results && (
-          <div style={{ textAlign:"center", padding:"52px 0", color:"#1e293b" }}>
-            <div style={{ fontSize:42, marginBottom:12 }}>⬡</div>
-            <div style={{ fontFamily:"'DM Mono',monospace", fontSize:13, color:"#334155" }}>
-              Carga la Base GDC y el archivo proveedor para iniciar
-            </div>
-            <div style={{ fontSize:11, marginTop:6, color:"#1e293b" }}>
-              INPUT CSV · XLSX · XLS · XLSM — EXPORT XLSX
-            </div>
-            <div style={{ display:"flex", gap:10, justifyContent:"center", marginTop:16 }}>
-              {["Exact = 100%","Fuzzy ≥ 85%","Address ≥ 80%","AI ≥ 65%"].map(t => (
-                <span
-                  key={t}
-                  style={{
-                    background:"#0a1020",
-                    border:"1px solid #1e293b",
-                    borderRadius:6,
-                    padding:"3px 12px",
-                    fontSize:10,
-                    color:"#334155",
-                    fontFamily:"'DM Mono',monospace"
-                  }}
-                >
-                  {t}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
 
       <div style={{
@@ -1481,8 +1466,8 @@ export default function App() {
         display:"flex",
         justifyContent:"space-between"
       }}>
-        <span>POS MATCHER v2.0 · PHARMA DATA ENGINEERING</span>
-        <span>EXPORT XLSX · INPUT CSV/XLSX/XLS · MULTI-SHEET · FUZZY ≥85% · ADDRESS ≥80%</span>
+        <span>POS MATCHER v3.0 · SALIDA HOMOLOGADA</span>
+        <span>EXPORT XLSX · ESTRUCTURA ÚNICA PARA TODOS LOS PROVEEDORES</span>
       </div>
     </div>
   );
