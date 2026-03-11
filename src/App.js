@@ -417,7 +417,13 @@ function getProviderConfig(provName, headers) {
     fileNameNorm.includes("FARMAENLACE") ||
     (hset.has("FARMACIA") && hset.has("PROVINCIA VENTA"));
 
-  return { isGPF, isFarmaenlace };
+  // Difare: archivo de establecimientos con columna SegmentoNombre
+  const isDifare =
+    fileNameNorm.includes("ESTABLECIMIENTO") ||
+    fileNameNorm.includes("DIFARE") ||
+    (hset.has("IDCLIENTE") && hset.has("ESTABLECIMIENTO") && hset.has("SEGMENTONOMBRE"));
+
+  return { isGPF, isFarmaenlace, isDifare };
 }
 
 function detectProviderColumnsForPreview(rows, fileName) {
@@ -447,6 +453,16 @@ function detectProviderColumnsForPreview(rows, fileName) {
       name: resolveColumn(headers, "Farmacia", detected.name),
       prov: resolveColumn(headers, "Provincia Venta", detected.prov),
       city: null,
+    };
+  }
+
+  if (providerCfg.isDifare) {
+    detected = {
+      ...detected,
+      name: resolveColumn(headers, "Establecimiento", detected.name),
+      city: resolveColumn(headers, "Canton", detected.city),
+      prov: resolveColumn(headers, "Provincia", detected.prov),
+      code: resolveColumn(headers, "IdCliente", detected.code),
     };
   }
 
@@ -1053,9 +1069,27 @@ export default function App() {
       };
     }
 
+    if (providerCfg.isDifare) {
+      detected = {
+        ...detected,
+        name: resolveColumn(headers, "Establecimiento", detected.name),
+        city: resolveColumn(headers, "Canton", detected.city),
+        prov: resolveColumn(headers, "Provincia", detected.prov),
+        code: resolveColumn(headers, "IdCliente", detected.code),
+      };
+    }
+
     setColMap(detected);
 
-    const uniqueCount = getUniqueCount(provData, detected);
+    // Para Difare: filtrar solo Grupo G y Franquicias
+    const activeProvData = providerCfg.isDifare
+      ? provData.filter(r => {
+          const seg = String(r["SegmentoNombre"] || r["Segmento"] || "").trim();
+          return seg === "Grupo G" || seg === "Franquicias";
+        })
+      : provData;
+
+    const uniqueCount = getUniqueCount(activeProvData, detected);
     setUniqueProvCount(uniqueCount);
 
     const preparedGdc = preprocessGDC(gdcData);
@@ -1064,7 +1098,7 @@ export default function App() {
     const uniqueRecords = [];
     const resultByKey = new Map();
 
-    for (const rec of provData) {
+    for (const rec of activeProvData) {
       const key = buildUniqueKey(rec, detected);
       if (!seen.has(key)) {
         seen.add(key);
@@ -1287,6 +1321,11 @@ export default function App() {
                 ✓ {uniqueProvCount.toLocaleString()} farmacias únicas
                 <span style={{ color: "#475569" }}>
                   {" · "}{provData.length.toLocaleString()} filas origen
+                  {providerCfgState?.isDifare && (
+                    <span style={{ color: "#0ea5e9" }}>
+                      {" · "}solo Grupo G + Franquicias
+                    </span>
+                  )}
                 </span>
               </div>
             )}
