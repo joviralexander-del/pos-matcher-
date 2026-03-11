@@ -16,7 +16,8 @@ function useSheetJS() {
 // ─── TEXT NORMALIZATION ───────────────────────────────────────────────────────
 const REMOVE_WORDS = [
   "FARMACIA","FARM","BOTICA","DROGUERIA","DRG","PHARMA",
-  "LOCAL","SUCURSAL","FARMACEUTICA","FARMACÉUTICA","DISPENSARIO","DISPENSARY"
+  "SUCURSAL","FARMACEUTICA","FARMACÉUTICA","DISPENSARIO","DISPENSARY",
+  "FAR"  // prefijo FAR. usado en GDC (FAR.ECONOMICA, FAR.SANASANA, etc.)
 ];
 
 function removeAccents(str) {
@@ -27,15 +28,69 @@ function normalizeText(text) {
   if (!text) return "";
   let s = String(text).toUpperCase();
   s = removeAccents(s);
-  s = s.replace(/[^A-Z0-9\s]/g, " ");
+  s = s.replace(/[^A-Z0-9\s]/g, " ");  // quita puntos, guiones, comas
   REMOVE_WORDS.forEach(w => {
-    s = s.replace(new RegExp(`\\b${w}\\.?\\b`, "g"), " ");
+    s = s.replace(new RegExp(`\\b${w}\\b`, "g"), " ");
   });
   return s.replace(/\s+/g, " ").trim();
 }
 
-// ─── LEVENSHTEIN SIMILARITY ───────────────────────────────────────────────────
-function similarity(a, b) {
+// ─── ALIAS DICTIONARY — Variaciones conocidas de cadenas ─────────────────────
+const CHAIN_ALIASES = [
+  // Farmacias Económicas
+  { from: /^ECO\b/,            to: "FAR ECONOMICA" },
+  { from: /^ECONOMIA\b/,       to: "FAR ECONOMICA" },
+  { from: /^ECONOMICA\b/,      to: "FAR ECONOMICA" },
+  // Medicity / MDI
+  { from: /^MEDICITY\b/,       to: "MEDICITY" },
+  { from: /^MDI\b/,            to: "MEDICITY" },
+  { from: /^MEDI\b/,           to: "MEDICITY" },
+  // Cruz Azul
+  { from: /^CA\b/,             to: "CRUZ AZUL" },
+  { from: /^CRUZ AZUL\b/,      to: "CRUZ AZUL" },
+  // BP
+  { from: /^FARMACIA BP\b/,    to: "BP" },
+  { from: /^BP\b/,             to: "BP" },
+  // Pharmacys
+  { from: /^PH\b/,             to: "PHARMACYS" },
+  { from: /^PHARMACYS\b/,      to: "PHARMACYS" },
+  // Comunitaria
+  { from: /^COM\b/,            to: "COMUNITARIA" },
+  // Sanasana / Fybeca (misma cadena)
+  { from: /^SANASANA\b/,       to: "SANASANA" },
+  { from: /^FYBECA\b/,         to: "SANASANA" },
+  // PAF
+  { from: /^PAF\b/,            to: "PAF" },
+  // Difarmes
+  { from: /^MAY DIFARMES\b/,   to: "DIFARMES" },
+  { from: /^DIFARMES\b/,       to: "DIFARMES" },
+  // Dr farmacias
+  { from: /^DR\b/,             to: "DR" },
+];
+
+function stripSuffix(name) {
+  return name
+    .replace(/,\s*[A-Za-z]{1,4}\d{2,4}\s*$/i, "")    // ", Cg304" ", Bpp03"
+    .replace(/\s+[A-Za-z]{1,3}\d{3,4}\s*$/i, "")      // " Dg001" " Pt001"
+    .replace(/\s*#?\s*0*(\d{1,3})\s*[-–]\s*/g, " ")   // "08 -" "# 1 -"
+    .replace(/\s+[A-Z]\.\w+(\s+\d+)?.*$/i, "")        // " A.lascano 115 ..."
+    .replace(/\bCUE\b/g, "")                            // prefijo ciudad Cuenca
+    .replace(/\bUIO\b/g, "")                            // prefijo ciudad Quito
+    .replace(/\bGYE\b/g, "")                            // prefijo ciudad Guayaquil
+    .replace(/\bAMB\b/g, "")                            // prefijo ciudad Ambato
+    .replace(/\s+/g, " ").trim();
+}
+
+function applyAliases(normName) {
+  let s = normName;
+  for (const { from, to } of CHAIN_ALIASES) {
+    if (from.test(s)) {
+      s = s.replace(from, to).replace(/\s+/g, " ").trim();
+      break;
+    }
+  }
+  return s;
+}function similarity(a, b) {
   const na = normalizeText(a), nb = normalizeText(b);
   if (!na || !nb) return 0;
   if (na === nb) return 100;
@@ -52,9 +107,9 @@ function similarity(a, b) {
 }
 
 // ─── COLUMN DETECTION ─────────────────────────────────────────────────────────
-const NAME_COLS = ["FARMACIA","CLIENTE","ESTABLECIMIENTO","NOMBRE CLIENTE","PUNTO DE VENTA","LOCAL","NOMBRE LOCAL","NOMBRE"];
+const NAME_COLS = ["NOMBRE LOCAL","FARMACIA","PUNTO DE VENTA","CLIENTE","ESTABLECIMIENTO","NOMBRE CLIENTE","LOCAL","NOMBRE"];
 const CITY_COLS = ["CIUDAD","CANTON","CANTÓN","CITY"];
-const PROV_COLS = ["PROVINCIA","PROVINCE","PROV"];
+const PROV_COLS = ["PROVINCIA VENTA","PROVINCIA","PROVINCE","PROV"];
 const ADDR_COLS = ["DIRECCION","DIRECCIÓN","ADDRESS","DIR","DOMICILIO"];
 
 function detectCol(headers, candidates) {
@@ -111,46 +166,62 @@ function readFileAsync(file) {
 
 // ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
 function matchRecord(record, gdc, colMap) {
-  const normName = normalizeText(record[colMap.name] || "");
+  const rawName = stripSuffix(record[colMap.name] || "");
+  const normName = applyAliases(normalizeText(rawName));
   const normCity = normalizeText(record[colMap.city] || "");
+  const normProv = normalizeText(record[colMap.prov] || "");
   const normAddr = normalizeText(record[colMap.addr] || "");
 
-  const pool = normCity
-    ? gdc.filter(g => normalizeText(g["CIUDAD"] || "") === normCity)
-    : gdc;
-  const searchPool = pool.length > 0 ? pool : gdc;
+  // Filtrar GDC: primero por ciudad, si no hay ciudad filtrar por provincia
+  let pool = gdc;
+  if (normCity) {
+    const byCity = gdc.filter(g => normalizeText(g["CIUDAD"] || "") === normCity);
+    pool = byCity.length > 0 ? byCity : gdc;
+  } else if (normProv) {
+    const byProv = gdc.filter(g => normalizeText(g["PROVINCIA"] || "") === normProv);
+    pool = byProv.length > 0 ? byProv : gdc;
+  }
 
   let best = null, bestScore = 0, bestType = "NO_MATCH";
 
-  for (const g of searchPool) {
+  for (const g of pool) {
     const gName = normalizeText(g["PUNTO DE VENTA"] || "");
     const gCity = normalizeText(g["CIUDAD"] || "");
+    const gProv = normalizeText(g["PROVINCIA"] || "");
     const gAddr = normalizeText(g["DIRECCIÓN"] || g["DIRECCION"] || "");
-    const cityMatch = normCity ? normCity === gCity : true;
 
-    if (normName === gName && cityMatch) {
+    // Validar coincidencia geográfica
+    const cityMatch = normCity ? normCity === gCity : true;
+    const provMatch = normProv ? normProv === gProv : true;
+    const geoMatch = normCity ? cityMatch : normProv ? provMatch : true;
+
+    // L1 — Exact
+    if (normName === gName && geoMatch) {
       return { ...g, MATCH_SCORE: 100, TIPO_MATCH: "EXACT_MATCH" };
     }
 
+    // L2 — Fuzzy nombre
     const nameSim = similarity(normName, gName);
-    if (nameSim >= 88 && cityMatch) {
-      const score = Math.round(nameSim * 0.85 + (cityMatch ? 15 : 0));
+    if (nameSim >= 80 && geoMatch) {
+      const score = Math.min(99, Math.round(nameSim * 0.85 + (geoMatch ? 15 : 0)));
       if (score > bestScore) { bestScore = score; best = g; bestType = "FUZZY_MATCH"; }
     }
 
+    // L3 — Address
     if (normAddr && gAddr) {
       const addrSim = similarity(normAddr, gAddr);
-      if (addrSim >= 80 && cityMatch) {
-        const score = Math.round(addrSim * 0.7 + (cityMatch ? 20 : 0));
+      if (addrSim >= 80 && geoMatch) {
+        const score = Math.round(addrSim * 0.7 + (geoMatch ? 20 : 0));
         if (score > bestScore) { bestScore = score; best = g; bestType = "ADDRESS_MATCH"; }
       }
     }
 
+    // L4 — AI word overlap
     if (normName && gName && nameSim >= 55) {
       const words = normName.split(" ").filter(w => w.length > 2);
       const matched = words.filter(w => gName.includes(w));
       if (words.length > 0) {
-        const aiScore = Math.round((matched.length / words.length) * 75 + (cityMatch ? 15 : 0));
+        const aiScore = Math.round((matched.length / words.length) * 75 + (geoMatch ? 15 : 0));
         if (aiScore >= 60 && aiScore > bestScore) {
           bestScore = aiScore; best = g; bestType = "AI_MATCH";
         }
@@ -324,27 +395,48 @@ export default function App() {
     };
     setColMap(detected);
 
+    // Deduplicar por nombre+ciudad para no repetir matches
+    const seen = new Set();
+    const uniqueRecords = [];
+    const dupMap = {}; // clave -> resultado match
+
+    for (const rec of provData) {
+      const key = `${rec[detected.name]||""}__${rec[detected.city]||""}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueRecords.push({ rec, key });
+      }
+    }
+
     const matched = [], unmatched = [];
     let exact=0, fuzzy=0, address=0, ai=0, none=0;
     const total = provData.length;
-    const BATCH = 300;
+    const BATCH = 200;
 
-    for (let i = 0; i < total; i += BATCH) {
-      const batch = provData.slice(i, i + BATCH);
-      for (const rec of batch) {
+    // Procesar solo registros únicos
+    for (let i = 0; i < uniqueRecords.length; i += BATCH) {
+      const batch = uniqueRecords.slice(i, i + BATCH);
+      for (const { rec, key } of batch) {
         const r = matchRecord(rec, gdcData, detected);
-        const enriched = { ...rec, ...r };
-        if (r.TIPO_MATCH === "NO_MATCH") { none++; unmatched.push(enriched); }
-        else {
-          if (r.TIPO_MATCH === "EXACT_MATCH") exact++;
-          else if (r.TIPO_MATCH === "FUZZY_MATCH") fuzzy++;
-          else if (r.TIPO_MATCH === "ADDRESS_MATCH") address++;
-          else if (r.TIPO_MATCH === "AI_MATCH") ai++;
-          matched.push(enriched);
-        }
+        dupMap[key] = r;
       }
-      setProgress(Math.round(((i + BATCH) / total) * 100));
+      setProgress(Math.round(((i + BATCH) / uniqueRecords.length) * 100));
       await new Promise(r => setTimeout(r, 0));
+    }
+
+    // Aplicar resultado a todos los registros originales
+    for (const rec of provData) {
+      const key = `${rec[detected.name]||""}__${rec[detected.city]||""}`;
+      const r = dupMap[key] || { "COD POS": null, MATCH_SCORE: 0, TIPO_MATCH: "NO_MATCH" };
+      const enriched = { ...rec, ...r };
+      if (r.TIPO_MATCH === "NO_MATCH") { none++; unmatched.push(enriched); }
+      else {
+        if (r.TIPO_MATCH === "EXACT_MATCH") exact++;
+        else if (r.TIPO_MATCH === "FUZZY_MATCH") fuzzy++;
+        else if (r.TIPO_MATCH === "ADDRESS_MATCH") address++;
+        else if (r.TIPO_MATCH === "AI_MATCH") ai++;
+        matched.push(enriched);
+      }
     }
 
     setResults([...matched, ...unmatched]);
