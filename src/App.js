@@ -25,6 +25,17 @@ const REMOVE_WORDS = [
   "FAR"
 ];
 
+// Abreviaturas de ciudad usadas por Difare en nombres de establecimientos
+// Deben definirse antes de normalizeText que las usa
+const DIFARE_CITY_ABBRS = new Set([
+  "UIO","GYE","CUE","AMB","RIO","MAN","MCH","IBA","SDO","LAT",
+  "SAM","DAU","DUR","RUM","BAB","LOJ","MAC","ESM","TUL","POR",
+  "BAH","LIB","SAL","MIL","STA","SCD","BFE","GAE","QUE",
+  "ALO","ARC","ATA","AZO","CAY","COT","GAL","GUA","HUA","JAM",
+  "LAG","LTR","MON","NAR","OTA","PAS","PEL","PIL","PUJ","QUI",
+  "SAQ","SHA","TEN","TON","ZAM",
+]);
+
 function removeAccents(str) {
   return String(str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
@@ -59,6 +70,8 @@ function normalizeText(text) {
   REMOVE_WORDS.forEach(w => {
     s = s.replace(new RegExp(`\\b${w}\\b`, "g"), " ");
   });
+  // Eliminar abreviaturas de ciudad de Difare embebidas en el nombre
+  s = s.replace(/\b([A-Z]{2,4})\b/g, (m) => DIFARE_CITY_ABBRS.has(m) ? " " : m);
   s = expandAbbrev(s);
   return s.replace(/\s+/g, " ").trim();
 }
@@ -84,15 +97,14 @@ const CHAIN_ALIASES = [
 
 function stripSuffix(name) {
   return String(name || "")
-    .replace(/,\s*[A-Za-z]{1,4}\d{2,4}\s*$/i, "")
+    .replace(/,\s*[A-Za-z]{1,6}\d{2,6}\s*$/i, "")          // ", Ft003" ", Pg005" ", T5680"
     .replace(/\s+[A-Za-z]{1,3}\d{3,4}\s*$/i, "")
-    .replace(/\s*#?\s*0*(\d{1,3})\s*[-–]\s*/g, " ")       // "08 -" o "1 -" → " "
-    .replace(/\b(SANASANA|FYBECA)\s+08\b\s*/gi, "$1 ")     // "SANASANA 08 X" → "SANASANA X"
+    .replace(/\s*#?\s*0*(\d{1,3})\s*[-–]\s*/g, " ")         // "08 -" o "1 -" → " "
+    .replace(/\b(SANASANA|FYBECA)\s+08\b\s*/gi, "$1 ")       // "SANASANA 08 X" → "SANASANA X"
     .replace(/\s+[A-Z]\.\w+(\s+\d+)?.*$/i, "")
-    .replace(/\bCUE\b/g, "")
-    .replace(/\bUIO\b/g, "")
-    .replace(/\bGYE\b/g, "")
-    .replace(/\bAMB\b/g, "")
+    // Abreviaturas de ciudad (mayúsculas o Mixed Case)
+    .replace(/\bCUE\b/gi, "").replace(/\bUIO\b/gi, "")
+    .replace(/\bGYE\b/gi, "").replace(/\bAMB\b/gi, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -197,8 +209,13 @@ function parseCSVText(text) {
   const lines = String(text || "").split(/\r?\n/).filter(l => l.trim());
   if (!lines.length) return [];
 
-  const sep = lines[0].includes(";") ? ";" : ",";
-  const headers = lines[0].split(sep).map(h => h.replace(/^"|"$/g, "").trim());
+  // Detectar separador: |  ;  o  ,
+  const firstLine = lines[0];
+  const sep = firstLine.includes("|") ? "|"
+            : firstLine.includes(";") ? ";"
+            : ",";
+
+  const headers = firstLine.split(sep).map(h => h.replace(/^"|"$/g, "").trim());
 
   return lines
     .slice(1)
@@ -368,7 +385,11 @@ const GENERIC_WORDS = new Set([
   "SANTA", "ROSA", "MILAGRO", "NARANJAL", "PLAYAS", "GENERAL", "PEDRO",
   "CIUDAD", "AV", "AVENIDA", "CALLE", "CDLA", "CIUDADELA", "HOSP", "HOSPITAL",
   "CLINICA", "IESS", "PARQ", "PARQUE", "CC", "CENTRO", "COMERCIAL", "NORTE", "SUR", "ESTE", "OESTE",
-  "LOCAL", "MATRIZ", "OFICINA"
+  "LOCAL", "MATRIZ", "OFICINA",
+  // Abreviaturas de ciudad usadas por Difare en el nombre del establecimiento
+  "UIO", "GYE", "CUE", "AMB", "RIO", "MAN", "MCH", "IBA", "SDO", "LAT",
+  "SAM", "DAU", "DUR", "RUM", "BAB", "LOJ", "MAC", "ESM", "TUL", "POR",
+  "BAH", "LIB", "SAL", "MIL", "STA", "SCD",
 ]);
 
 function wordOverlapRatio(a, b) {
@@ -491,8 +512,10 @@ function matchRecord(record, preparedGdc, colMap) {
     };
   }
 
-  const normCity = normalizeText(record[colMap.city] || "");
-  const normProv = normalizeText(record[colMap.prov] || "");
+  // Limpiar valores placeholder de Difare ("<sin Provincia>", "<sin Ciudad>", "<sin Definir>")
+  const cleanGeo = (v) => (!v || /^<sin /i.test(v)) ? "" : v;
+  const normCity = normalizeText(cleanGeo(record[colMap.city] || ""));
+  const normProv = normalizeText(cleanGeo(record[colMap.prov] || ""));
   const normAddr = normalizeText(record[colMap.addr] || "");
 
   let pool = preparedGdc.rows;
