@@ -36,36 +36,28 @@ function normalizeText(text) {
 }
 
 // ─── ALIAS DICTIONARY — Variaciones conocidas de cadenas ─────────────────────
+// IMPORTANTE: los aliases deben producir el mismo texto que la normalización de la GDC
+// GDC: "FAR.ECONOMICA QUITO X" → normalizado → "ECONOMICA QUITO X"
+// Proveedor: "ECO QUITO X" → alias → "ECONOMICA QUITO X" ✅
 const CHAIN_ALIASES = [
-  // Farmacias Económicas
-  { from: /^ECO\b/,            to: "FAR ECONOMICA" },
-  { from: /^ECONOMIA\b/,       to: "FAR ECONOMICA" },
-  { from: /^ECONOMICA\b/,      to: "FAR ECONOMICA" },
+  // Farmacias Económicas (GDC: FAR.ECONOMICA → normaliza a ECONOMICA)
+  { from: /^ECO\b/,            to: "ECONOMICA" },
+  { from: /^ECONOMIA\b/,       to: "ECONOMICA" },
   // Medicity / MDI
-  { from: /^MEDICITY\b/,       to: "MEDICITY" },
-  { from: /^MDI\b/,            to: "MEDICITY" },
   { from: /^MEDI\b/,           to: "MEDICITY" },
-  // Cruz Azul
+  { from: /^MDI\b/,            to: "MEDICITY" },
+  // Metrored → PAF MTR
+  { from: /^METRORED\b/,       to: "PAF MTR" },
+  // Cruz Azul (GDC: FAR.CRUZ AZUL → normaliza a CRUZ AZUL)
   { from: /^CA\b/,             to: "CRUZ AZUL" },
-  { from: /^CRUZ AZUL\b/,      to: "CRUZ AZUL" },
-  // BP
+  // BP (GDC: FAR.BP → normaliza a BP)
   { from: /^FARMACIA BP\b/,    to: "BP" },
-  { from: /^BP\b/,             to: "BP" },
-  // Pharmacys
+  // Pharmacys (GDC: FAR.PHARMACYS → normaliza a PHARMACYS)
   { from: /^PH\b/,             to: "PHARMACYS" },
-  { from: /^PHARMACYS\b/,      to: "PHARMACYS" },
-  // Comunitaria
+  // Comunitaria (GDC: FAR.COMUNITARIA → normaliza a COMUNITARIA)
   { from: /^COM\b/,            to: "COMUNITARIA" },
-  // Sanasana / Fybeca (misma cadena)
-  { from: /^SANASANA\b/,       to: "SANASANA" },
-  { from: /^FYBECA\b/,         to: "SANASANA" },
-  // PAF
-  { from: /^PAF\b/,            to: "PAF" },
-  // Difarmes
-  { from: /^MAY DIFARMES\b/,   to: "DIFARMES" },
-  { from: /^DIFARMES\b/,       to: "DIFARMES" },
-  // Dr farmacias
-  { from: /^DR\b/,             to: "DR" },
+  // Difarmes (GDC: FAR.MAY DIFARMES → normaliza a MAY DIFARMES)
+  { from: /^MAY DIFARMES\b/,   to: "MAY DIFARMES" },
 ];
 
 function stripSuffix(name) {
@@ -188,6 +180,24 @@ function readFileAsync(file) {
   });
 }
 
+// ─── WORD OVERLAP — evita falsos positivos ────────────────────────────────────
+// Palabras que NO distinguen locales (cadena + ciudades principales)
+const GENERIC_WORDS = new Set([
+  "ECONOMICA","MEDICITY","SANASANA","FYBECA","CRUZ","AZUL","PAF","MTR",
+  "PHARMACYS","BP","COMUNITARIA","DIFARMES","MAY","DR","METRORED",
+  "QUITO","GUAYAQUIL","AMBATO","RIOBAMBA","CUENCA","MANTA","LOJA",
+  "PORTOVIEJO","IBARRA","ESMERALDAS","MACHALA","LATACUNGA","SANTO"
+]);
+
+function wordOverlapRatio(a, b) {
+  const bSet = new Set(b.split(" ").filter(w => w.length > 1));
+  // Solo considerar palabras significativas (no genéricas) del proveedor
+  const meaningful = a.split(" ").filter(w => w.length > 1 && !GENERIC_WORDS.has(w));
+  if (meaningful.length === 0) return 1.0; // si no hay palabras significativas, no penalizar
+  const shared = meaningful.filter(w => bSet.has(w)).length;
+  return shared / meaningful.length;
+}
+
 // ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
 function matchRecord(record, gdc, colMap) {
   const rawName = stripSuffix(record[colMap.name] || "");
@@ -233,10 +243,11 @@ function matchRecord(record, gdc, colMap) {
       return { ...g, MATCH_SCORE: 100, TIPO_MATCH: "EXACT_MATCH" };
     }
 
-    // L2 — Fuzzy nombre
+    // L2 — Fuzzy nombre + word overlap para evitar falsos positivos
     const nameSim = similarity(normName, gName);
-    if (nameSim >= 80 && geoMatch) {
-      const score = Math.min(99, Math.round(nameSim * 0.85 + (geoMatch ? 15 : 0)));
+    const overlap = wordOverlapRatio(normName, gName);
+    if (nameSim >= 85 && overlap >= 0.6 && geoMatch) {
+      const score = Math.min(99, Math.round(nameSim * 0.85 + 14));
       if (score > bestScore) { bestScore = score; best = g; bestType = "FUZZY_MATCH"; }
     }
 
@@ -244,20 +255,16 @@ function matchRecord(record, gdc, colMap) {
     if (normAddr && gAddr) {
       const addrSim = similarity(normAddr, gAddr);
       if (addrSim >= 80 && geoMatch) {
-        const score = Math.round(addrSim * 0.7 + (geoMatch ? 20 : 0));
+        const score = Math.round(addrSim * 0.7 + 20);
         if (score > bestScore) { bestScore = score; best = g; bestType = "ADDRESS_MATCH"; }
       }
     }
 
-    // L4 — AI word overlap
-    if (normName && gName && nameSim >= 55) {
-      const words = normName.split(" ").filter(w => w.length > 2);
-      const matched = words.filter(w => gName.includes(w));
-      if (words.length > 0) {
-        const aiScore = Math.round((matched.length / words.length) * 75 + (geoMatch ? 15 : 0));
-        if (aiScore >= 60 && aiScore > bestScore) {
-          bestScore = aiScore; best = g; bestType = "AI_MATCH";
-        }
+    // L4 — AI: overlap alto de palabras significativas (sin ciudad ni cadena)
+    if (normName && gName && nameSim >= 60 && overlap >= 0.65 && geoMatch) {
+      const aiScore = Math.round(overlap * 75 + 15);
+      if (aiScore >= 65 && aiScore > bestScore) {
+        bestScore = aiScore; best = g; bestType = "AI_MATCH";
       }
     }
   }
