@@ -77,7 +77,6 @@ const CHAIN_ALIASES = [
   { from: /^MAY DIFARMES\b/, to: "MAY DIFARMES" },
   { from: /^DIFARMES\b/, to: "MAY DIFARMES" },
   { from: /^PAF \w+ DIFARMES\b/, to: "MAY DIFARMES" },
-  // SANA SANA (con espacio) → SANASANA
   { from: /^SANA SANA\b/, to: "SANASANA" },
 ];
 
@@ -85,9 +84,8 @@ function stripSuffix(name) {
   return String(name || "")
     .replace(/,\s*[A-Za-z]{1,4}\d{2,4}\s*$/i, "")
     .replace(/\s+[A-Za-z]{1,3}\d{3,4}\s*$/i, "")
-    .replace(/\s*#?\s*0*(\d{1,3})\s*[-–]\s*/g, " ")  // "08 -" → " "
-    // Eliminar " 08 " como prefijo de local GPF (SANASANA 08 X, FYBECA 08 X)
-    .replace(/\b(SANASANA|FYBECA)\s+08\b\s*/gi, "$1 ")
+    .replace(/\s*#?\s*0*(\d{1,3})\s*[-–]\s*/g, " ")       // "08 -" o "1 -" → " "
+    .replace(/\b(SANASANA|FYBECA)\s+08\b\s*/gi, "$1 ")     // "SANASANA 08 X" → "SANASANA X"
     .replace(/\s+[A-Z]\.\w+(\s+\d+)?.*$/i, "")
     .replace(/\bCUE\b/g, "")
     .replace(/\bUIO\b/g, "")
@@ -136,10 +134,8 @@ function similarity(a, b) {
 // ─── COLUMN DETECTION ─────────────────────────────────────────────────────────
 const NAME_COLS = ["NOMBRE LOCAL", "FARMACIA", "PUNTO DE VENTA", "CLIENTE", "ESTABLECIMIENTO", "NOMBRE CLIENTE", "LOCAL", "NOMBRE"];
 const CITY_COLS = ["CIUDAD", "CANTON", "CANTÓN", "CITY"];
-const PROV_COLS = ["PROVINCIA VENTA", "PROVINCIA", "PROVINCE", "PROV"];
 
-// Equivalencias de ciudades: GPF/proveedor puede usar nombre de cantón o nombre común
-// mientras GDC usa el nombre oficial de la ciudad
+// Equivalencias ciudad GPF ↔ ciudad GDC (GPF usa nombre de cantón, GDC usa ciudad oficial)
 const CITY_ALIASES = {
   "BANOS DE AGUA SANTA": ["BANOS"],
   "BANOS":               ["BANOS DE AGUA SANTA"],
@@ -149,7 +145,7 @@ const CITY_ALIASES = {
   "ANTONIO ANTE":        ["ATUNTAQUI"],
   "ATUNTAQUI":           ["ANTONIO ANTE"],
   "GENERAL VILLAMIL PLAYAS": ["PLAYAS","VILLAMIL"],
-  "PLAYAS":              ["GENERAL VILLAMIL PLAYAS","VILLAMIL"],
+  "PLAYAS":              ["GENERAL VILLAMIL PLAYAS"],
   "LA TRONCAL CANAR":    ["LA TRONCAL"],
   "LA TRONCAL":          ["LA TRONCAL CANAR"],
   "SAN MIGUEL DE BOLIVAR": ["SAN MIGUEL"],
@@ -161,18 +157,13 @@ const CITY_ALIASES = {
   "LOS ESTEROS":         ["MANTA"],
   "MORONA SANTIAGO":     ["MACAS"],
   "MACAS":               ["MORONA SANTIAGO"],
-  "SALITRE":             ["URBINA JADO","SALITRE"],
-  "SAMBORONDON":         ["SAMBORONDON"],
-  "SANTA CRUZ":          ["SANTA CRUZ"],
-  "RUMIÑAHUI":           ["SANGOLQUI","RUMINAHUI"],
-  "RUMINAHUI":           ["SANGOLQUI","RUMIÑAHUI"],
-  "SANGOLQUI":           ["RUMINAHUI","RUMIÑAHUI"],
-  "CUMBAYA":             ["QUITO","CUMBAYA"],
-  "TUMBACO":             ["QUITO","TUMBACO"],
-  "SAN RAFAEL":          ["SANGOLQUI","RUMINAHUI"],
-  "ESPEJO":              ["EL ANGEL","ESPEJO"],
+  "RUMINAHUI":           ["SANGOLQUI"],
+  "SANGOLQUI":           ["RUMINAHUI"],
+  "ESPEJO":              ["EL ANGEL"],
   "EL ANGEL":            ["ESPEJO"],
+  "SALITRE":             ["URBINA JADO"],
 };
+const PROV_COLS = ["PROVINCIA VENTA", "PROVINCIA", "PROVINCE", "PROV"];
 const ADDR_COLS = ["DIRECCION", "DIRECCIÓN", "ADDRESS", "DIR", "DOMICILIO"];
 const CODE_COLS = ["COD LOCAL", "CODIGO LOCAL", "CÓDIGO LOCAL", "CODIGO", "CÓDIGO", "ID LOCAL", "LOCAL ID"];
 
@@ -500,9 +491,9 @@ function matchRecord(record, preparedGdc, colMap) {
     pool = preparedGdc.byCity.get(normCity);
     geoFiltered = true;
   } else if (normCity) {
-    // Intentar aliases de ciudad (GPF usa nombre de cantón, GDC usa nombre de ciudad)
-    const cityAlt = CITY_ALIASES[normCity] || [];
-    for (const alt of cityAlt) {
+    // Intentar aliases de ciudad (GPF nombre de cantón ↔ GDC nombre de ciudad)
+    const alts = CITY_ALIASES[normCity] || [];
+    for (const alt of alts) {
       const altNorm = normalizeText(alt);
       if (preparedGdc.byCity.has(altNorm)) {
         pool = preparedGdc.byCity.get(altNorm);
@@ -510,10 +501,10 @@ function matchRecord(record, preparedGdc, colMap) {
         break;
       }
     }
-    // Si aún no encontramos, intentar match parcial de ciudad
+    // Fallback: match parcial de ciudad
     if (!geoFiltered) {
       for (const [gdcCity, gdcRows] of preparedGdc.byCity) {
-        if (gdcCity.includes(normCity) || normCity.includes(gdcCity)) {
+        if (gdcCity.length > 3 && (gdcCity.includes(normCity) || normCity.includes(gdcCity))) {
           pool = gdcRows;
           geoFiltered = true;
           break;
@@ -543,8 +534,7 @@ function matchRecord(record, preparedGdc, colMap) {
     if (!chainAllowed(normName, gName)) continue;
     if (suffixConflict(normName, gName)) continue;
 
-    // L1 — Exact: si el nombre coincide perfecto, aceptar aunque no haya geo-filtro
-    // (en el pool completo un nombre exacto como SANASANA ALAUSI solo existe una vez)
+    // L1 — Exact: nombre idéntico siempre matchea (en GDC un nombre exacto es único)
     if (normName === gName) {
       return { ...g, MATCH_SCORE: 100, TIPO_MATCH: "EXACT_MATCH" };
     }
