@@ -180,6 +180,33 @@ function readFileAsync(file) {
   });
 }
 
+// ─── CHAIN COMPATIBILITY MAP ──────────────────────────────────────────────────
+// Evita matches entre cadenas distintas (ECO → PAF MTR, MEDI → SANASANA, etc.)
+const CHAIN_MAP = [
+  { prefix: /^ECONOMICA\b/,    allowed: ["ECONOMICA"] },
+  { prefix: /^MEDICITY\b/,     allowed: ["MEDICITY"] },
+  { prefix: /^PAF MTR\b/,      allowed: ["PAF MTR"] },
+  { prefix: /^MAY BOYACA\b/,   allowed: ["MAY BOYACA"] },
+  { prefix: /^MAY FARMAYOR\b/, allowed: ["MAY FARMAYOR"] },
+  { prefix: /^MAY DIFARMES\b/, allowed: ["MAY DIFARMES"] },
+  { prefix: /^SANASANA\b/,     allowed: ["SANASANA", "FYBECA"] },
+  { prefix: /^FYBECA\b/,       allowed: ["FYBECA", "SANASANA"] },
+  { prefix: /^CRUZ AZUL\b/,    allowed: ["CRUZ AZUL"] },
+  { prefix: /^BP\b/,           allowed: ["BP"] },
+  { prefix: /^PHARMACYS\b/,    allowed: ["PHARMACYS"] },
+  { prefix: /^COMUNITARIA\b/,  allowed: ["COMUNITARIA"] },
+  { prefix: /^DIFARMES\b/,     allowed: ["DIFARMES"] },
+];
+
+function chainAllowed(normProvName, normGdcName) {
+  for (const { prefix, allowed } of CHAIN_MAP) {
+    if (prefix.test(normProvName)) {
+      return allowed.some(a => normGdcName.includes(a));
+    }
+  }
+  return true; // cadena desconocida: no bloquear
+}
+
 // ─── WORD OVERLAP — evita falsos positivos ────────────────────────────────────
 // Palabras que NO distinguen locales (cadena + ciudades principales)
 const GENERIC_WORDS = new Set([
@@ -238,6 +265,9 @@ function matchRecord(record, gdc, colMap) {
     const provMatch = normProv ? normProv === gProv : true;
     const geoMatch = geoFiltered ? true : (normCity ? cityMatch : normProv ? provMatch : true);
 
+    // Bloquear matches entre cadenas incompatibles (aplica a todos los niveles)
+    if (!chainAllowed(normName, gName)) continue;
+
     // L1 — Exact
     if (normName === gName && geoMatch) {
       return { ...g, MATCH_SCORE: 100, TIPO_MATCH: "EXACT_MATCH" };
@@ -260,10 +290,11 @@ function matchRecord(record, gdc, colMap) {
       }
     }
 
-    // L4 — AI: overlap alto de palabras significativas (sin ciudad ni cadena)
-    if (normName && gName && nameSim >= 60 && overlap >= 0.65 && geoMatch) {
-      const aiScore = Math.round(overlap * 75 + 15);
-      if (aiScore >= 65 && aiScore > bestScore) {
+    // L4 — AI: overlap ALTO de palabras significativas — umbral estricto para evitar falsos positivos
+    // overlap >= 0.8 = al menos 80% de palabras únicas del proveedor aparecen en GDC
+    if (normName && gName && nameSim >= 65 && overlap >= 0.8 && geoMatch) {
+      const aiScore = Math.round(overlap * 80 + 10);
+      if (aiScore >= 75 && aiScore > bestScore) {
         bestScore = aiScore; best = g; bestType = "AI_MATCH";
       }
     }
@@ -470,7 +501,10 @@ export default function App() {
       const geo = rec[detected.city] || rec[detected.prov] || "";
       const key = `${rec[detected.name]||""}__${geo}`;
       const r = dupMap[key] || { "COD POS": null, MATCH_SCORE: 0, TIPO_MATCH: "NO_MATCH" };
-      const enriched = { ...rec, ...r };
+      // Extraer solo el número del BRICK (ej: "3402 - RIOBAMBA" → "3402")
+      const brickRaw = r["BRICK"] || "";
+      const brickNum = brickRaw.match(/^\d+/) ? brickRaw.match(/^\d+/)[0] : brickRaw;
+      const enriched = { ...rec, ...r, BRICK: brickNum };
       if (r.TIPO_MATCH === "NO_MATCH") { none++; unmatched.push(enriched); }
       else {
         if (r.TIPO_MATCH === "EXACT_MATCH") exact++;
