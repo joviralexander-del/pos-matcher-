@@ -78,6 +78,8 @@ const CHAIN_ALIASES = [
   { from: /^DIFARMES\b/, to: "MAY DIFARMES" },
   { from: /^PAF \w+ DIFARMES\b/, to: "MAY DIFARMES" },
   { from: /^SANA SANA\b/, to: "SANASANA" },
+  // SS = abreviatura GPF de SANASANA (ej. SS GALAPAGOS LA ALBORADA)
+  { from: /^SS\b/, to: "SANASANA" },
 ];
 
 function stripSuffix(name) {
@@ -311,7 +313,15 @@ function suffixConflict(provName, gdcName) {
   const sp = normSuffix(extractSuffix(provName));
   const sg = normSuffix(extractSuffix(gdcName));
 
-  if (sp && !sg) return true;
+  // Si proveedor tiene sufijo pero GDC no:
+  // Para ECO/MEDI → bloquear (RECREO 2 ≠ RECREO son locales distintos)
+  // Para SANASANA/FYBECA → NO bloquear (GPF usa numeración interna, GDC puede no tenerla)
+  if (sp && !sg) {
+    const isSanasanaFybeca = /^(SANASANA|FYBECA)\b/.test(provName);
+    if (isSanasanaFybeca) return false;  // permitir el match
+    return true;                          // bloquear para otras cadenas
+  }
+
   if (!sp || !sg) return false;
   if (sp === sg) return false;
   if (sg.startsWith(sp) || sp.startsWith(sg)) return false;
@@ -467,7 +477,8 @@ function matchRecord(record, preparedGdc, colMap) {
   const rawName = stripSuffix(record[colMap.name] || "");
   const normName = applyAliases(normalizeText(rawName));
 
-  if (/OFICINA MATRIZ/i.test(rawName)) {
+  // Registros que no son farmacias físicas → ignorar
+  if (!rawName || /OFICINA MATRIZ|FARCOMED VIRTUAL|VIRTUAL/i.test(rawName)) {
     return {
       "COD POS": "",
       "PUNTO DE VENTA": "",
